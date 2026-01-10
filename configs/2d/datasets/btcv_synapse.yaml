@@ -1,0 +1,44 @@
+name: "btcv_synapse"
+
+task:
+  # BTCV/Synapse multi-organ label ids vary by release.
+  # Default: keep raw ids unchanged; set num_classes high enough and adjust label_map if needed.
+  # NOTE: This particular dump (DET*_avg_seg) audits as binary labels {0,1}.
+  # If you later switch to a true multi-organ Synapse/BTCV release, bump num_classes and set label_map.
+  num_classes: 2
+  include_background_in_mean: false
+  ignore_index: null
+  label_map: {}
+
+paths:
+  raw_dir: "data/raw/BTCV_Synapse"
+  processed_dir: "data/processed/btcv_synapse"
+  splits_dir: "data/splits/btcv_synapse"
+
+raw_structure:
+  # Expected manual placement:
+  # data/raw/BTCV_Synapse/imagesTr/*.nii.gz and labelsTr/*.nii.gz (or images/labels)
+  images_tr_dir: "imagesTr"
+  labels_tr_dir: "labelsTr"
+  # This BTCV dump uses label filenames like: <image>_seg.nii.gz
+  label_suffix: "_seg"
+
+input:
+  image_size: [256, 256]
+  image_channels: 1
+  normalize:
+    mode: "imagenet"
+
+nifti:
+  slice_axis: 0
+  slice_policy: "non_empty"
+  min_fg_pixels: 10
+  intensity:
+    mode: "ct_window"
+    ct_window: [-125, 275]
+
+split:
+  type: "5fold_from_all"
+  folds: 5
+  seed: 42
+  group_key: "patient_id"

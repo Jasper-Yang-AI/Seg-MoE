@@ -1,0 +1,13 @@
+# Debug overrides (fast smoke run)
+
+overrides:
+  seed: 123
+  training:
+    epochs: 2
+    batch_size: 2
+  datalimits:
+    limit_train_samples: 16
+    limit_val_samples: 16
+    limit_test_samples: 16
+  caching:
+    enabled: false

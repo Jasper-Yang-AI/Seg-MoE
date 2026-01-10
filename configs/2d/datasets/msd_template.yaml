@@ -1,0 +1,76 @@
+# ============================================================
+# MSD (Medical Segmentation Decathlon) 通用配置模板
+# ============================================================
+# 使用方式：
+#   1. 复制本文件为 msd_taskXX_yyy.yaml（如 msd_task04_hippocampus.yaml）
+#   2. 修改下面 ★ 标记的字段
+#   3. 把解压后的 TaskXX_YYY 目录放到 data/raw/MSD_TaskXX_YYY/TaskXX_YYY/
+#   4. 运行：python scripts/prepare_msd.py --config configs/2d/datasets/msd_taskXX_yyy.yaml
+# ============================================================
+
+# ★ 数据集名称（会用于 processed/splits 目录名、日志标签）
+name: "msd_taskXX_yyy"
+
+task:
+  # ★ 类别数（含背景）。常见：
+  #   - Task01 BrainTumour: 4 (0=bg,1=edema,2=non-enhancing,3=enhancing)
+  #   - Task02 Heart: 2 (0=bg,1=left atrium)
+  #   - Task03 Liver: 3 (0=bg,1=liver,2=tumor)
+  #   - Task04 Hippocampus: 3 (0=bg,1=anterior,2=posterior)
+  #   - Task05 Prostate: 3 (0=bg,1=PZ,2=TZ)
+  #   - Task06 Lung: 2 (0=bg,1=tumor)
+  #   - Task07 Pancreas: 3 (0=bg,1=pancreas,2=tumor)
+  #   - Task08 HepaticVessel: 3 (0=bg,1=vessel,2=tumor)
+  #   - Task09 Spleen: 2 (0=bg,1=spleen)
+  #   - Task10 Colon: 2 (0=bg,1=tumor)
+  num_classes: 3
+  include_background_in_mean: false
+  ignore_index: null
+  # ★ 如需重映射 label id，在此配置；否则留空 {}
+  label_map: {}
+
+paths:
+  # ★ 原始数据目录（解压后根目录）
+  raw_dir: "data/raw/MSD_TaskXX_YYY"
+  # ★ 输出的 processed 目录
+  processed_dir: "data/processed/msd_taskXX_yyy"
+  # ★ 输出的 splits 目录
+  splits_dir: "data/splits/msd_taskXX_yyy"
+
+raw_structure:
+  # ★ 相对于 raw_dir 的 images/labels 子目录
+  images_tr_dir: "TaskXX_YYY/imagesTr"
+  labels_tr_dir: "TaskXX_YYY/labelsTr"
+  # 可选：dataset.json 路径（仅用于日志/元数据）
+  dataset_json: "TaskXX_YYY/dataset.json"
+  # 若 label 文件名和 image 有 suffix 差异（如 _seg），在此配置
+  # label_suffix: "_seg"
+
+input:
+  image_size: [256, 256]
+  image_channels: 1
+  normalize:
+    mode: "imagenet"
+
+nifti:
+  # 切片轴：SimpleITK GetArrayFromImage -> [z,y,x]，通常 0 为 axial
+  slice_axis: 0
+  # all: 保留所有切片；non_empty: 只保留有前景的切片
+  slice_policy: "non_empty"
+  # 切片至少要有多少个非背景像素才保留
+  min_fg_pixels: 10
+  intensity:
+    # minmax: 体素 min-max 归一化；ct_window: 窗宽窗位裁剪后归一化
+    mode: "minmax"
+    # 若 mode=ct_window，需设置 [window_min, window_max]
+    ct_window: [-125, 275]
+
+split:
+  # 5fold_from_all: 全部样本 5-fold
+  # holdout20_then_5fold: 先留 20% test，再 5-fold
+  # train_5fold_test_fixed: 有固定 test 集时用
+  type: "5fold_from_all"
+  folds: 5
+  seed: 42
+  # ★ 按 patient_id 分组防泄漏（推荐）
+  group_key: "patient_id"

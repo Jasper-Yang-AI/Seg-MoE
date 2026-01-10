@@ -1,0 +1,46 @@
+# Seg_MoE 2D reproduction experiment (Dang et al., Springer 2024)
+# This is the single entry-point config consumed by scripts/*.
+
+exp_name: "segmoe_2d_msd07"
+
+seed: 42
+
+deterministic:
+  torch_deterministic: true
+  cudnn_benchmark: false
+
+# Dataset config is selected via its YAML under configs/2d/datasets/
+dataset:
+  name: "msd_task07_pancreas"
+  config: "configs/2d/datasets/msd_task07_pancreas.yaml"
+
+# Which methods to run in scripts/eval_methods.py and scripts/export_tables.py
+methods:
+  - single
+  - unetpp
+  - ole9
+  - dt9
+  - we_clpso
+  - proposed_2layer
+
+experts:
+  architectures: ["unet", "linknet", "fpn"]
+  backbones: ["vgg16", "resnet34", "resnet101"]
+  pretrained: "imagenet"
+
+layering:
+  cache_dtype: "float16"
+  cache_root: "runs/${exp_name}/cache"
+  layer1_probs_dir: "runs/${exp_name}/cache/layer1_probs"
+  layer2_probs_dir: "runs/${exp_name}/cache/layer2_probs"
+  i_star:
+    concat_image: true
+    concat_probs: true
+
+output:
+  run_dir: "runs/${exp_name}"
+  save_pred_masks: true
+  save_pred_probs: false
+  save_vis: false
+  results_dir: "runs/${exp_name}/results"
+  tables_dir: "runs/${exp_name}/tables"

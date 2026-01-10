@@ -1,0 +1,42 @@
+name: "msd_task03_liver"
+
+task:
+  # MSD Task03 has labels: 0=background, 1=liver, 2=tumor (commonly)
+  num_classes: 3
+  include_background_in_mean: false
+  ignore_index: null
+  label_map:
+    0: 0
+    1: 1
+    2: 2
+
+paths:
+  raw_dir: "data/raw/Task03_Liver"
+  processed_dir: "data/processed/msd_task03_liver"
+  splits_dir: "data/splits/msd_task03_liver"
+
+raw_structure:
+  # Actual structure: data/raw/Task03_Liver/{imagesTr,labelsTr}
+  images_tr_dir: "imagesTr"
+  labels_tr_dir: "labelsTr"
+  dataset_json: "dataset.json"
+
+input:
+  image_size: [256, 256]
+  image_channels: 1
+  normalize:
+    mode: "imagenet"
+
+nifti:
+  slice_axis: 0          # SimpleITK GetArrayFromImage -> [z,y,x]
+  slice_policy: "non_empty"  # all|non_empty
+  min_fg_pixels: 10
+  intensity:
+    mode: "minmax"       # minmax|ct_window
+    ct_window: [-125, 275]
+
+split:
+  type: "5fold_from_all"
+  folds: 5
+  seed: 42
+  group_key: "patient_id"

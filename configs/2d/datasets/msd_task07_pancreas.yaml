@@ -1,0 +1,42 @@
+name: "msd_task07_pancreas"
+
+task:
+  # MSD Task07 commonly uses: 0=background, 1=pancreas, 2=tumor
+  num_classes: 3
+  include_background_in_mean: false
+  ignore_index: null
+  label_map:
+    0: 0
+    1: 1
+    2: 2
+
+paths:
+  raw_dir: "data/raw/Task07_Pancreas"
+  processed_dir: "data/processed/msd_task07_pancreas"
+  splits_dir: "data/splits/msd_task07_pancreas"
+
+raw_structure:
+  # Actual structure: data/raw/Task07_Pancreas/{imagesTr,labelsTr}
+  images_tr_dir: "imagesTr"
+  labels_tr_dir: "labelsTr"
+  dataset_json: "dataset.json"
+
+input:
+  image_size: [256, 256]
+  image_channels: 1
+  normalize:
+    mode: "imagenet"
+
+nifti:
+  slice_axis: 0
+  slice_policy: "non_empty"
+  min_fg_pixels: 10
+  intensity:
+    mode: "minmax"
+    ct_window: [-125, 275]
+
+split:
+  type: "5fold_from_all"
+  folds: 5
+  seed: 42
+  group_key: "patient_id"

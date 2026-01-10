@@ -1,0 +1,6 @@
+{
+  "type": "5fold_from_all",
+  "folds": 5,
+  "seed": 42,
+  "group_key": "patient_id"
+}

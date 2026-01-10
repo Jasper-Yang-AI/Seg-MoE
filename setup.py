@@ -1,0 +1,49 @@
+from setuptools import setup, find_packages
+
+setup(
+    name="seg_moe",
+    version="0.1.0",
+    description="Two-Layer Ensemble of Deep Learning Models for Medical Image Segmentation",
+    author="Research Team",
+    author_email="your-email@example.com",
+    packages=find_packages(where="src"),
+    package_dir={"": "src"},
+    python_requires=">=3.10",
+    install_requires=[
+        "torch>=2.0.0",
+        "torchvision>=0.15.0",
+        "segmentation-models-pytorch>=0.3.3",
+        "SimpleITK>=2.2.0",
+        "nibabel>=5.0.0",
+        "pydicom>=2.3.0",
+        "scikit-image>=0.21.0",
+        "albumentations>=1.3.0",
+        "opencv-python>=4.7.0",
+        "numpy>=1.24.0",
+        "scipy>=1.10.0",
+        "pandas>=2.0.0",
+        "pyyaml>=6.0",
+        "tqdm>=4.65.0",
+        "matplotlib>=3.7.0",
+    ],
+    extras_require={
+        "dev": [
+            "pytest>=7.3.0",
+            "black>=23.3.0",
+            "flake8>=6.0.0",
+            "isort>=5.12.0",
+        ],
+        "full": [
+            "monai>=1.2.0",
+            "wandb>=0.15.0",
+            "pyswarm>=0.6",
+        ],
+    },
+    classifiers=[
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: Science/Research",
+        "License :: OSI Approved :: MIT License",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+    ],
+)

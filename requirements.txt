@@ -1,0 +1,30 @@
+# Deep Learning (torch is intentionally not CUDA-pinned)
+torch>=2.0.0
+torchvision>=0.15.0
+segmentation-models-pytorch>=0.3.3
+
+# Core
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+tqdm>=4.65.0
+pyyaml>=6.0
+omegaconf>=2.3.0
+
+# Image I/O & augmentation
+pillow>=9.5.0
+opencv-python>=4.7.0
+albumentations>=1.3.0
+scikit-image>=0.21.0
+
+# Medical formats (nii/nii.gz, mhd/mha, dicom)
+SimpleITK>=2.2.0
+nibabel>=5.0.0
+pydicom>=2.3.0
+
+# Logging/visualization
+tensorboard>=2.12.0
+matplotlib>=3.7.0
+
+# Testing
+pytest>=7.3.0
