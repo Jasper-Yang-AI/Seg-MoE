@@ -299,22 +299,26 @@ python scripts/make_splits.py --dataset-config configs/2d/datasets/acdc.yaml
 python scripts/check_labels.py --dataset-config configs/2d/datasets/acdc.yaml --splits --sample 50
 python scripts/visualize_overlay.py --dataset-config configs/2d/datasets/acdc.yaml --n 12
 
-# 2) layer1: 9 专家（debug 配置会把 epochs/samples 压到很小）
-python scripts/train_2d_experts.py --exp configs/2d/experiment.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --debug configs/2d/debug.yaml --fold 0 --layer layer1 --dataset-config configs/2d/datasets/acdc.yaml
+# 2) layer1: 9 专家
+python scripts/train_2d_experts.py --exp configs/2d/exp/exp_name.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --fold 0 --layer layer1  --resume last --skip-if-done
 
-# 3) cache layer1 probs
-python scripts/cache_probs.py --exp configs/2d/experiment.yaml --models configs/2d/models.yaml --layer layer1 --fold 0 --which best --skip-existing --dataset-config configs/2d/datasets/acdc.yaml
+# 3) cache layer1 probs(train and valid)
+python scripts/cache_probs.py --exp configs/2d/exp/exp_name.yaml --models configs/2d/models.yaml --layer layer1 --fold 0 --which best --split train_fold0 --skip-existing
+
+python scripts/cache_probs.py --exp configs/2d/exp/exp_name.yaml --models configs/2d/models.yaml --layer layer1 --fold 0 --which best --split val_fold0 --skip-existing
 
 # 4) layer2（需要 layer1 cache）
-python scripts/train_layer2.py --exp configs/2d/experiment.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --fold 0 --dataset-config configs/2d/datasets/acdc.yaml
+python scripts/train_layer2.py --exp configs/2d/exp/exp_name.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --fold 0 --resume last --skip-if-done
 
-# 5) cache layer2 probs
-python scripts/cache_probs.py --exp configs/2d/experiment.yaml --models configs/2d/models.yaml --layer layer2 --fold 0 --which best --skip-existing --dataset-config configs/2d/datasets/acdc.yaml
+# 5) cache layer2 probs(train and valid)
+python scripts/cache_probs.py --exp configs/2d/exp/exp_name.yaml --models configs/2d/models.yaml --layer layer2 --fold 0 --which best --split train_fold0 --skip-existing
+
+python scripts/cache_probs.py --exp configs/2d/exp/exp_name.yaml --models configs/2d/models.yaml --layer layer2 --fold 0 --which best --split val_fold0 --skip-existing
 
 # 6) eval + export
-python scripts/eval_methods.py --exp configs/2d/experiment.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --fold 0 --dataset-config configs/2d/datasets/acdc.yaml
-python scripts/export_tables.py --exp configs/2d/experiment.yaml
-python scripts/export_weights.py --exp configs/2d/experiment.yaml
+python scripts/eval_methods.py --exp configs/2d/exp/exp_name.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --fold 0 --which best
+python scripts/export_tables.py --exp configs/2d/exp/exp_name.yaml
+python scripts/export_weights.py --exp configs/2d/exp/exp_name.yaml
 ```
 
 ### 单卡全量复现的调度建议（多天级别）

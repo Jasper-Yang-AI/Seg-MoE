@@ -11,8 +11,8 @@ deterministic:
 
 # Dataset config is selected via its YAML under configs/2d/datasets/
 dataset:
-  name: "cvc_colondb"
-  config: "configs/2d/datasets/cvc_colondb.yaml"
+  name: ""
+  config: "configs/2d/datasets/name.yaml"
 
 # Which methods to run in scripts/eval_methods.py and scripts/export_tables.py
 methods:
