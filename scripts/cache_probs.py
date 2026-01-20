@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from seg_moe.data.dataset_2d import SegmentationDataset2D
+from seg_moe.data.layer2_dataset import Layer2Dataset
 from seg_moe.data.indexing import infer_image_channels, infer_num_classes
 from seg_moe.models.factory_2d import build_smp_model, expert_name, list_experts
 from seg_moe.utils.config import load_config, resolve_run_dir
@@ -58,15 +59,30 @@ def main() -> None:
     target_splits = [args.split] if args.split else [s for s in splits if s.startswith("train_fold") or s.startswith("val_fold") or s == "test"]
 
     num_classes = infer_num_classes(dataset_cfg)
-    in_channels = infer_image_channels(dataset_cfg)
+    base_in_channels = infer_image_channels(dataset_cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     experts = list_experts(models_cfg)
+    num_experts = len(experts)
     encoder_weights = models_cfg.get("smp", {}).get("encoder_weights", "imagenet")
 
     for split in target_splits:
         split_rows = [r for r in rows if r.get("split") == split]
-        ds = SegmentationDataset2D(split_rows, dataset_cfg, augs_cfg=None, is_train=False)
+        base_ds = SegmentationDataset2D(split_rows, dataset_cfg, augs_cfg=None, is_train=False)
+
+        if args.layer == "layer2":
+            # Layer2 consumes I* = concat(image, layer1_probs[K,M,H,W] flattened to K*M channels)
+            layer1_split_dir = cache_root / "layer1_probs" / dataset_cfg["name"] / split
+            if not layer1_split_dir.exists():
+                raise FileNotFoundError(
+                    f"Missing layer1 cache for split '{split}': {layer1_split_dir}. "
+                    f"Run cache_probs with --layer layer1 for the same split first."
+                )
+            ds = Layer2Dataset(base_ds, layer1_split_dir, num_experts=num_experts, num_classes=num_classes)
+            in_channels = base_in_channels + num_experts * num_classes
+        else:
+            ds = base_ds
+            in_channels = base_in_channels
         dl = DataLoader(ds, batch_size=1, shuffle=False)
 
         split_dir = out_root / split
