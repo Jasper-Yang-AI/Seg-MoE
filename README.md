@@ -11,6 +11,7 @@
 ## 🔬 项目特点
 
 - ✅ **论文方法复现**：9个专家模型 + 两层 stacking + 多种融合方法（OLE/DT/WE-CLPSO）
+- ✅ **SOTA模型支持**：Swin-UNetR (Transformer) + nnUNet v2 (CNN) + SegMamba (Mamba) 异构专家
 - ✅ **多格式支持**：PNG/JPEG + NIfTI/MetaImage/DICOM 等医学格式
 - ✅ **两层集成架构**：Layer1专家 → 概率图拼接 → Layer2专家 → 融合器
 - ✅ **严格可复现**：固定随机种子、5-fold交叉验证、详细日志
@@ -40,8 +41,9 @@ Seg_MoE/
 ├── configs/              # YAML配置驱动
 │   ├── 2d/               # 2D pipeline 配置
 │   │   ├── datasets/     # 数据集配置（MSD/ACDC/BTCV 等）
-│   │   ├── models/       # 9个专家+融合器配置
-│   │   ├── training/     # 训练超参
+│   │   ├── models.yaml   # 原始9专家配置
+│   │   ├── models_sota.yaml  # ⭐ SOTA模型配置（Swin-UNetR/nnUNet/SegMamba）
+│   │   ├── training.yaml # 训练超参
 │   │   └── 3d/           # 3D扩展预留
 ├── data/
 │   ├── raw/              # 原始数据（手动放置）
@@ -50,6 +52,10 @@ Seg_MoE/
 ├── src/seg_moe/          # 主代码包
 │   ├── data/             # 数据加载（多格式支持）
 │   ├── models/           # 专家模型
+│   │   ├── factory_2d.py      # 原始SMP模型工厂
+│   │   ├── factory_sota.py    # ⭐ SOTA模型工厂
+│   │   ├── wrappers/          # ⭐ SOTA模型封装
+│   │   └── architectures/     # ⭐ 外部模型架构
 │   ├── combiners/        # 融合器（OLE/DT/WE-CLPSO）
 │   ├── training/         # 训练流程
 │   ├── evaluation/       # 评估指标
@@ -74,6 +80,17 @@ pip install -r requirements.txt
 
 # 安装本项目包
 pip install -e .
+
+# 安装SOTA模型支持
+pip install monai>=1.3.0        # Swin-UNetR
+pip install nnunetv2>=2.2       # nnUNet v2
+pip install timm>=0.9.0 einops>=0.7.0  # 支持库
+
+# 或使用自动安装脚本
+python scripts/install_sota_models.py
+
+# 验证SOTA模型
+python scripts/test_sota_models.py
 ```
 
 ### 2. 数据准备
@@ -129,10 +146,17 @@ python scripts/visualize_overlay.py --dataset-config configs/2d/datasets/msd_tas
 # python scripts/prepare_msd.py --config configs/2d/datasets/msd_taskXX_xxx.yaml
 
 # BTCV
-python scripts/prepare_btcv_synapse.py --config configs/2d/datasets/btcv_synapse.yaml
-python scripts/make_splits.py --dataset-config configs/2d/datasets/btcv_synapse.yaml
-python scripts/check_labels.py --dataset-config configs/2d/datasets/btcv_synapse.yaml --splits --sample 50
-python scripts/visualize_overlay.py --dataset-config configs/2d/datasets/btcv_synapse.yaml --n 12
+
+# 选项A: 使用原始9个专家（UNet/LinkNet/FPN）
+python scripts/train_2d_experts.py --exp configs/2d/exp/exp_acdc.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --debug configs/2d/debug.yaml --fold 0 --layer layer1
+
+# 选项B: ⭐ 使用SOTA异构专家（Swin-UNetR/nnUNet/SegMamba）
+python scripts/train_2d_experts.py --exp configs/2d/exp/exp_acdc.yaml --training configs/2d/training.yaml --models configs/2d/models_sota.yaml --augs configs/2d/augs.yaml --debug configs/2d/debug.yaml --fold 0 --layer layer1
+```
+
+### 4. 训练专家（Layer1）
+
+#### 选项A：原始9个专家（论文复现lize_overlay.py --dataset-config configs/2d/datasets/btcv_synapse.yaml --n 12
 ```
 
 ### 3. Debug验证（快速测试pipeline）
@@ -140,7 +164,66 @@ python scripts/visualize_overlay.py --dataset-config configs/2d/datasets/btcv_sy
 ```bash
 # 小规模快速测试（少量数据+少量 epoch），验证训练/评估/缓存主链路
 # 建议先选 ACDC 或 MSD 的单个数据集跑 fold0
-python scripts/train_2d_experts.py --exp configs/2d/exp/exp_acdc.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --debug configs/2d/debug.yaml --fold 0 --layer layer1
+python scripts/train_2d_experts.py --exp configs/2d/exp/exp_acdc.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --debug configs/2d/debu
+
+# UNet++ baseline（强单模型）
+python scripts/train_unetpp.py --exp configs/2d/exp/exp_acdc.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --fold 0
+```
+
+#### 选项B：⭐ SOTA异构专家（推荐）
+
+```bash
+# 训练3个SOTA异构专家：Swin-UNetR + nnUNet v2 + SegMamba
+python scripts/train_2d_experts.py --exp configs/2d/exp/exp_acdc.yaml --training configs/2d/training.yaml --models configs/2d/models_sota.yaml --augs configs/2d/augs.yaml --layer layer1 --fold 0
+
+# 优势：训练时间缩短（3个 vs 9个），架构更多样化（CNN + Transformer + Mamba）
+# 详细说明：docs/QUICKSTART_SOTA.md
+```
+
+---
+
+## 🌟 SOTA模型集成（NEW）
+
+### 支持的异构专家
+
+| 模型 | 类型 | 来源 | 特点 |
+|------|------|------|------|
+| **Swin-UNetR** | Transformer | MONAI | 自注意力，长距离依赖 |
+| **nnUNet v2** | Modern CNN | nnUNetv2 | 自适应设计，多挑战SOTA |
+| **SegMamba** | Mamba/SSM | GitHub | 线性复杂度，高效分割 |
+
+### 快速开始
+
+```bash
+# 1. 安装SOTA模型
+python scripts/install_sota_models.py
+
+# 2. 测试安装
+python scripts/test_sota_models.py
+
+# 3. 使用SOTA模型训练
+python scripts/train_2d_experts.py \
+  --models configs/2d/models_sota.yaml \
+  --exp configs/2d/exp/exp_acdc.yaml \
+  --training configs/2d/training.yaml \
+  --augs configs/2d/augs.yaml
+```
+
+### 详细文档
+
+- 📘 [SOTA模型安装指南](docs/INSTALL_SOTA_MODELS.md)
+- 🚀 [SOTA快速入门](docs/QUICKSTART_SOTA.md)
+- 📋 [集成总结](docs/SOTA_INTEGRATION_SUMMARY.md)
+
+---
+
+## 🔧 训练流程（完整）
+
+### 选项A：原始9专家（论文复现）
+
+```bash
+# Layer1: 9专家
+python scripts/train_2d_experts.py --exp configs/2d/exp/exp_acdc.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --layer layer1 --fold 0g.yaml --fold 0 --layer layer1
 ```
 
 ### 4. 训练9个专家（Layer1）

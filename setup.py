@@ -38,6 +38,12 @@ setup(
             "wandb>=0.15.0",
             "pyswarm>=0.6",
         ],
+        "sota": [
+            "monai>=1.3.0",
+            "nnunetv2>=2.2",
+            "timm>=0.9.0",
+            "einops>=0.7.0",
+        ],
     },
     classifiers=[
         "Development Status :: 3 - Alpha",

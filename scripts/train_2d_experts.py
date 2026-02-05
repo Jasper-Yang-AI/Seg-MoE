@@ -14,6 +14,13 @@ from seg_moe.utils.config import apply_debug_overrides, load_config, merge_confi
 from seg_moe.utils.io import ensure_dir, load_jsonl
 from seg_moe.utils.seed import seed_everything
 
+# SOTA models support
+try:
+    from seg_moe.models.factory_sota import build_sota_model, expert_name_sota, list_sota_experts
+    SOTA_AVAILABLE = True
+except ImportError:
+    SOTA_AVAILABLE = False
+
 
 def _load_splits(dataset_cfg: dict) -> list[dict]:
     splits_dir = Path(dataset_cfg["paths"]["splits_dir"])
@@ -93,37 +100,103 @@ def main() -> None:
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=int(training_cfg.get("dataloader", {}).get("num_workers", 4)), pin_memory=bool(training_cfg.get("dataloader", {}).get("pin_memory", True)))
     val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=int(training_cfg.get("dataloader", {}).get("num_workers", 4)), pin_memory=bool(training_cfg.get("dataloader", {}).get("pin_memory", True)))
 
-    experts = list_experts(models_cfg)
-    encoder_weights = models_cfg.get("smp", {}).get("encoder_weights", "imagenet")
+    # Detect if using SOTA models or classic SMP models
+    use_sota = SOTA_AVAILABLE and "sota_experts" in models_cfg
+    
+    if use_sota:
+        print("=" * 60)
+        print("Using SOTA model configuration (Swin-UNetR/nnUNet/VM-UNet)")
+        print("=" * 60)
+        
+        sota_experts_cfg = list_sota_experts(models_cfg)
+        for arch, config in sota_experts_cfg:
+            if not config.get("enabled", True):
+                print(f"Skipping disabled expert: {arch}")
+                continue
+            
+            name = config.get("name", expert_name_sota(arch))
+            tag = f"{args.layer}/fold{fold}/{name}"
+            ckpt_dir = Path(run_dir) / "checkpoints" / args.layer / f"fold{fold}" / name
+            best_ckpt = ckpt_dir / "best.pt"
+            last_ckpt = ckpt_dir / "last.pt"
+            
+            if args.skip_if_done and best_ckpt.exists():
+                print(f"Skip (exists): {best_ckpt}")
+                continue
 
-    for arch, backbone in experts:
-        tag = f"{args.layer}/fold{fold}/{expert_name(arch, backbone)}"
-        ckpt_dir = Path(run_dir) / "checkpoints" / args.layer / f"fold{fold}" / expert_name(arch, backbone)
-        best_ckpt = ckpt_dir / "best.pt"
-        last_ckpt = ckpt_dir / "last.pt"
-        if args.skip_if_done and best_ckpt.exists():
-            print(f"Skip (exists): {best_ckpt}")
-            continue
+            resume_from = None
+            if isinstance(args.resume, str) and args.resume.lower() in {"last", "best"}:
+                resume_from = str(last_ckpt if args.resume.lower() == "last" else best_ckpt)
+            elif isinstance(args.resume, str) and args.resume.lower() not in {"none", ""}:
+                resume_from = args.resume
 
-        resume_from = None
-        if isinstance(args.resume, str) and args.resume.lower() in {"last", "best"}:
-            resume_from = str(last_ckpt if args.resume.lower() == "last" else best_ckpt)
-        elif isinstance(args.resume, str) and args.resume.lower() not in {"none", ""}:
-            resume_from = args.resume
+            # Build SOTA model
+            print(f"\nBuilding SOTA model: {arch}")
+            model = build_sota_model(
+                arch=arch,
+                in_channels=in_channels,
+                classes=num_classes,
+                config=config.get("config", {}),
+                pretrained=config.get("pretrained", True),
+            )
+            
+            # Apply architecture-specific training adjustments
+            arch_training_cfg = training_cfg.copy()
+            sota_training = models_cfg.get("sota_training", {})
+            if arch in sota_training:
+                lr_mult = sota_training[arch].get("lr_multiplier", 1.0)
+                arch_training_cfg["lr"] = training_cfg["lr"] * lr_mult
+                print(f"  LR adjusted: {training_cfg['lr']:.2e} -> {arch_training_cfg['lr']:.2e} (×{lr_mult})")
+            
+            print(f"Training SOTA expert: {tag} on {device}")
+            train_model(
+                model,
+                train_loader,
+                val_loader,
+                num_classes=num_classes,
+                training_cfg=arch_training_cfg,
+                run_dir=run_dir,
+                tag=tag,
+                device=device,
+                resume_from=resume_from,
+            )
+    else:
+        # Classic SMP experts (9 experts: 3 arch × 3 backbones)
+        print("=" * 60)
+        print("Using classic SMP model configuration (UNet/LinkNet/FPN)")
+        print("=" * 60)
+        
+        experts = list_experts(models_cfg)
+        encoder_weights = models_cfg.get("smp", {}).get("encoder_weights", "imagenet")
 
-        model = build_smp_model(arch, backbone, in_channels=in_channels, classes=num_classes, encoder_weights=encoder_weights)
-        print(f"Training expert: {tag} on {device}")
-        train_model(
-            model,
-            train_loader,
-            val_loader,
-            num_classes=num_classes,
-            training_cfg=training_cfg,
-            run_dir=run_dir,
-            tag=tag,
-            device=device,
-            resume_from=resume_from,
-        )
+        for arch, backbone in experts:
+            tag = f"{args.layer}/fold{fold}/{expert_name(arch, backbone)}"
+            ckpt_dir = Path(run_dir) / "checkpoints" / args.layer / f"fold{fold}" / expert_name(arch, backbone)
+            best_ckpt = ckpt_dir / "best.pt"
+            last_ckpt = ckpt_dir / "last.pt"
+            if args.skip_if_done and best_ckpt.exists():
+                print(f"Skip (exists): {best_ckpt}")
+                continue
+
+            resume_from = None
+            if isinstance(args.resume, str) and args.resume.lower() in {"last", "best"}:
+                resume_from = str(last_ckpt if args.resume.lower() == "last" else best_ckpt)
+            elif isinstance(args.resume, str) and args.resume.lower() not in {"none", ""}:
+                resume_from = args.resume
+
+            model = build_smp_model(arch, backbone, in_channels=in_channels, classes=num_classes, encoder_weights=encoder_weights)
+            print(f"Training expert: {tag} on {device}")
+            train_model(
+                model,
+                train_loader,
+                val_loader,
+                num_classes=num_classes,
+                training_cfg=training_cfg,
+                run_dir=run_dir,
+                tag=tag,
+                device=device,
+                resume_from=resume_from,
+            )
 
 
 if __name__ == "__main__":
