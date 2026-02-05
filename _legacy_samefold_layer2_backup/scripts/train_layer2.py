@@ -7,14 +7,14 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from seg_moe.data.dataset_2d import SegmentationDataset2D
 from seg_moe.data.indexing import infer_image_channels, infer_num_classes
 from seg_moe.models.factory_2d import build_smp_model, expert_name, list_experts
 from seg_moe.training.engine import train_model
-from seg_moe.utils.config import apply_debug_overrides, load_config, merge_configs, resolve_run_dir
+from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl
-from seg_moe.utils.seed import seed_everything
 
-from seg_moe.data.layer2_oof_dataset import Layer2OOFDataset
+from seg_moe.data.layer2_dataset import Layer2Dataset
 
 
 def _load_splits(dataset_cfg: dict) -> list[dict]:
@@ -34,7 +34,6 @@ def main() -> None:
     ap.add_argument("--training", required=True)
     ap.add_argument("--models", required=True)
     ap.add_argument("--augs", required=True)
-    ap.add_argument("--debug", default=None)
     ap.add_argument("--fold", type=int, default=0)
     ap.add_argument("--which", choices=["best", "last"], default="best")
     ap.add_argument("--dataset-config", default=None, help="Override dataset config YAML (instead of exp.dataset.config)")
@@ -51,39 +50,12 @@ def main() -> None:
     training_cfg = load_config(args.training)
     models_cfg = load_config(args.models)
     augs_cfg = load_config(args.augs)
-    debug_cfg = load_config(args.debug) if args.debug else None
-
-    merged = merge_configs(exp_cfg, {"training": training_cfg, "models": models_cfg, "augs": augs_cfg, "dataset_cfg": dataset_cfg})
-    merged = apply_debug_overrides(merged, debug_cfg)
-
-    seed = int(merged.get("seed", 42))
-    det = merged.get("deterministic", {})
-    seed_everything(
-        seed,
-        deterministic=bool(det.get("torch_deterministic", True)),
-        cudnn_benchmark=bool(det.get("cudnn_benchmark", False)),
-    )
 
     run_dir = resolve_run_dir(exp_cfg)
     ensure_dir(run_dir)
 
     cache_root = Path(exp_cfg["layering"]["cache_root"].replace("${exp_name}", exp_cfg["exp_name"]))
-    use_oof_for_layer2 = bool(exp_cfg.get("layering", {}).get("use_oof_for_layer2", True))
-    if not use_oof_for_layer2:
-        raise RuntimeError(
-            "Layer2 training is configured to be leakage-free and requires OOF probs. "
-            "Set layering.use_oof_for_layer2=true in the exp yaml."
-        )
-    oof_cache_dir = Path(
-        str(exp_cfg.get("layering", {}).get("oof_cache_dir", cache_root / "oof" / "layer1")).replace(
-            "${exp_name}", exp_cfg["exp_name"]
-        )
-    )
-    oof_manifest_path = Path(
-        str(exp_cfg.get("layering", {}).get("oof_manifest_path", oof_cache_dir / "oof_manifest.jsonl")).replace(
-            "${exp_name}", exp_cfg["exp_name"]
-        )
-    )
+    layer1_cache = cache_root / "layer1_probs" / dataset_cfg["name"]
 
     rows = _load_splits(dataset_cfg)
     fold = int(args.fold)
@@ -92,10 +64,6 @@ def main() -> None:
 
     train_rows = [r for r in rows if r.get("split") == train_split]
     val_rows = [r for r in rows if r.get("split") == val_split]
-
-    limits = (merged.get("datalimits", {}) or {})
-    train_limit = limits.get("limit_train_samples")
-    val_limit = limits.get("limit_val_samples")
 
     num_classes = infer_num_classes(dataset_cfg)
     base_in = infer_image_channels(dataset_cfg)
@@ -106,47 +74,16 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # build datasets (OOF-only)
-    # Use OOF probs for BOTH train and val splits.
-    # This prevents leakage: each sample's probs are produced by a model that did not see that sample.
-    train_ds = Layer2OOFDataset(
-        train_rows,
-        dataset_cfg,
-        oof_manifest_path,
-        expected_num_experts=K,
-        augs_cfg=augs_cfg,
-        is_train=True,
-        limit=train_limit,
-    )
-    val_ds = Layer2OOFDataset(
-        val_rows,
-        dataset_cfg,
-        oof_manifest_path,
-        expected_num_experts=K,
-        augs_cfg=augs_cfg,
-        is_train=False,
-        limit=val_limit,
-    )
-    print(f"Layer2 uses OOF probs: manifest={oof_manifest_path}")
+    # build datasets
+    train_base = SegmentationDataset2D(train_rows, dataset_cfg, augs_cfg=augs_cfg, is_train=True)
+    val_base = SegmentationDataset2D(val_rows, dataset_cfg, augs_cfg=augs_cfg, is_train=False)
 
-    bs = int((merged.get("training", {}) or {}).get("batch_size", training_cfg.get("batch_size", 8)))
-    epochs = int((merged.get("training", {}) or {}).get("epochs", training_cfg.get("epochs", 300)))
-    training_cfg = {**training_cfg, "batch_size": bs, "epochs": epochs}
+    train_ds = Layer2Dataset(train_base, layer1_cache / train_split, num_experts=K, num_classes=num_classes)
+    val_ds = Layer2Dataset(val_base, layer1_cache / val_split, num_experts=K, num_classes=num_classes)
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=bs,
-        shuffle=True,
-        num_workers=int(training_cfg.get("dataloader", {}).get("num_workers", 4)),
-        pin_memory=bool(training_cfg.get("dataloader", {}).get("pin_memory", True)),
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=bs,
-        shuffle=False,
-        num_workers=int(training_cfg.get("dataloader", {}).get("num_workers", 4)),
-        pin_memory=bool(training_cfg.get("dataloader", {}).get("pin_memory", True)),
-    )
+    bs = int(training_cfg.get("batch_size", 8))
+    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=int(training_cfg.get("dataloader", {}).get("num_workers", 4)))
+    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=int(training_cfg.get("dataloader", {}).get("num_workers", 4)))
 
     encoder_weights = models_cfg.get("smp", {}).get("encoder_weights", "imagenet")
 

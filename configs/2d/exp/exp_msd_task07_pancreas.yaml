@@ -29,18 +29,13 @@ experts:
   pretrained: "imagenet"
 
 layering:
-  cache_dtype: "float16"
   cache_root: "runs/${exp_name}/cache"
-  layer1_probs_dir: "runs/${exp_name}/cache/layer1_probs"
-  layer2_probs_dir: "runs/${exp_name}/cache/layer2_probs"
-  i_star:
-    concat_image: true
-    concat_probs: true
+  cache_dtype: "float16"
+  use_oof_for_layer2: true
+  oof_cache_dir: "runs/${exp_name}/cache/oof/layer1"
+  oof_manifest_path: "runs/${exp_name}/cache/oof/layer1/oof_manifest.jsonl"
 
 output:
   run_dir: "runs/${exp_name}"
-  save_pred_masks: true
-  save_pred_probs: false
-  save_vis: false
   results_dir: "runs/${exp_name}/results"
   tables_dir: "runs/${exp_name}/tables"

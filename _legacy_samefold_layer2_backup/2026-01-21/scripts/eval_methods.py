@@ -19,7 +19,6 @@ from seg_moe.models.factory_2d import build_smp_model, expert_name, list_experts
 from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl, save_json
 from seg_moe.data.layer2_dataset import Layer2Dataset
-from seg_moe.data.oof import load_oof_manifest
 
 
 def _load_splits(dataset_cfg: dict) -> list[dict]:
@@ -131,25 +130,7 @@ def main() -> None:
 
     # combiner methods require cached probs. If not available, skip.
     cache_root = Path(exp_cfg["layering"]["cache_root"].replace("${exp_name}", exp_cfg["exp_name"]))
-    oof_cache_dir = Path(
-        str(exp_cfg.get("layering", {}).get("oof_cache_dir", cache_root / "oof" / "layer1")).replace(
-            "${exp_name}", exp_cfg["exp_name"]
-        )
-    )
-    oof_manifest_path = Path(
-        str(exp_cfg.get("layering", {}).get("oof_manifest_path", oof_cache_dir / "oof_manifest.jsonl")).replace(
-            "${exp_name}", exp_cfg["exp_name"]
-        )
-    )
-    oof_map = None
-    if oof_manifest_path.exists():
-        oof_map = load_oof_manifest(oof_manifest_path)
-
-    def _layer1_probs_path(sample_id: str, split_name: str) -> Path:
-        # Prefer OOF manifest (leakage-free) when available.
-        if oof_map is not None and sample_id in oof_map:
-            return oof_map[sample_id].prob_path
-        return cache_root / "layer1_probs" / dataset_cfg["name"] / split_name / f"{sample_id}.npz"
+    l1_cache = cache_root / "layer1_probs" / dataset_cfg["name"] / split
 
     weights_out = {
         "dataset": dataset_cfg["name"],
@@ -160,17 +141,10 @@ def main() -> None:
         "layer2": {},
     }
 
-    # Layer1 combiner fitting/eval: needs layer1 probs for fit_split and eval split.
-    fit_split = f"val_fold{fold}"
-    fit_rows = [r for r in rows if r.get("split") == fit_split]
-    can_fit_l1 = False
-    if fit_rows and eval_rows:
-        p_fit = _layer1_probs_path(str(fit_rows[0]["id"]), fit_split)
-        p_eval = _layer1_probs_path(str(eval_rows[0]["id"]), split)
-        can_fit_l1 = p_fit.exists() and p_eval.exists()
-
-    if can_fit_l1:
+    if l1_cache.exists():
         # build flattened training data from val split for fitting combiners
+        fit_split = f"val_fold{fold}"
+        fit_rows = [r for r in rows if r.get("split") == fit_split]
         fit_ds = SegmentationDataset2D(fit_rows, dataset_cfg, augs_cfg=None, is_train=False)
         fit_dl = DataLoader(fit_ds, batch_size=1, shuffle=False)
 
@@ -178,7 +152,7 @@ def main() -> None:
         y_list = []
         for _, mask, meta in tqdm(fit_dl, desc="collect combiner fit"):
             sid = meta["id"][0]
-            npz = np.load(_layer1_probs_path(str(sid), fit_split))
+            npz = np.load(cache_root / "layer1_probs" / dataset_cfg["name"] / fit_split / f"{sid}.npz")
             probs = npz["probs"].astype(np.float32)  # [K,M,H,W]
             H, W = probs.shape[-2], probs.shape[-1]
             probs_flat = probs.transpose(2, 3, 0, 1).reshape(H * W, probs.shape[0], probs.shape[1])
@@ -202,7 +176,7 @@ def main() -> None:
             metrics = []
             for _, mask, meta in tqdm(dl, desc=f"eval {name}"):
                 sid = meta["id"][0]
-                npz = np.load(_layer1_probs_path(str(sid), split))
+                npz = np.load(l1_cache / f"{sid}.npz")
                 probs = npz["probs"].astype(np.float32)  # [K,M,H,W]
                 H, W = probs.shape[-2], probs.shape[-1]
                 probs_flat = probs.transpose(2, 3, 0, 1).reshape(H * W, probs.shape[0], probs.shape[1])
@@ -234,20 +208,12 @@ def main() -> None:
     if l2_cache.exists():
         # evaluate layer2 single experts (need I* input, built from layer1 probs)
         layer1_for_eval = cache_root / "layer1_probs" / dataset_cfg["name"] / split
-        can_use_oof_for_split = oof_manifest_path.exists() and split.startswith("val_fold")
-        if layer1_for_eval.exists() or can_use_oof_for_split:
+        if layer1_for_eval.exists():
             base_ds = SegmentationDataset2D(eval_rows, dataset_cfg, augs_cfg=None, is_train=False)
             base_in = in_channels
             K = len(experts)
             in_ch_l2 = base_in + K * num_classes
-            cache_dir = layer1_for_eval if layer1_for_eval.exists() else None
-            ds_l2 = Layer2Dataset(
-                base_ds,
-                cache_dir,
-                num_experts=K,
-                num_classes=num_classes,
-                oof_manifest_path=oof_manifest_path if oof_manifest_path.exists() else None,
-            )
+            ds_l2 = Layer2Dataset(base_ds, layer1_for_eval, num_experts=K, num_classes=num_classes)
             dl_l2 = DataLoader(ds_l2, batch_size=1, shuffle=False)
 
             for arch, backbone in experts:

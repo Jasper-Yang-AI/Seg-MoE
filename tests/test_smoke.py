@@ -27,3 +27,17 @@ def test_combiner_shapes_smoke():
     pso.fit(probs, target, num_classes=M)
     fused2 = pso.predict(probs)
     assert fused2.shape == (N, M)
+
+    from seg_moe.combiners.ole import fit_from_oof, fuse, predict
+
+    W_bvls = fit_from_oof(probs, target, method="bvls", bounds=(0.0, 1.0), seed=0)
+    scores = fuse(probs, W_bvls)
+    seg = predict(probs, W_bvls)
+    assert scores.shape == (N, M)
+    assert seg.shape == (N,)
+
+    W_nnls = fit_from_oof(probs, target, method="nnls")
+    scores2 = fuse(probs, W_nnls)
+    seg2 = predict(probs, W_nnls)
+    assert scores2.shape == (N, M)
+    assert seg2.shape == (N,)

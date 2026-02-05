@@ -50,40 +50,13 @@ def main() -> None:
 
     run_dir = resolve_run_dir(exp_cfg)
     cache_root = Path(exp_cfg["layering"]["cache_root"].replace("${exp_name}", exp_cfg["exp_name"]))
-    oof_cache_dir = Path(
-        str(exp_cfg.get("layering", {}).get("oof_cache_dir", cache_root / "oof" / "layer1")).replace(
-            "${exp_name}", exp_cfg["exp_name"]
-        )
-    )
-    oof_manifest_path = Path(
-        str(exp_cfg.get("layering", {}).get("oof_manifest_path", oof_cache_dir / "oof_manifest.jsonl")).replace(
-            "${exp_name}", exp_cfg["exp_name"]
-        )
-    )
-    cache_dtype_str = str(exp_cfg.get("layering", {}).get("cache_dtype", "float16")).lower()
-    if cache_dtype_str in {"float16", "fp16", "f16"}:
-        cache_dtype = np.float16
-    elif cache_dtype_str in {"float32", "fp32", "f32"}:
-        cache_dtype = np.float32
-    else:
-        raise ValueError(f"Unsupported cache_dtype: {cache_dtype_str} (use float16 or float32)")
     out_root = cache_root / f"{args.layer}_probs" / dataset_cfg["name"]
     ensure_dir(out_root)
 
     rows, _ = _load_splits(dataset_cfg)
     splits = sorted({r["split"] for r in rows})
 
-    if args.split:
-        target_splits = [args.split]
-    else:
-        if args.layer == "layer2":
-            # Layer2 caching only needs the eval split(s). Default to val_fold{fold} (+ test if exists).
-            cand = [f"val_fold{int(args.fold)}"]
-            if "test" in splits:
-                cand.append("test")
-            target_splits = [s for s in cand if s in splits]
-        else:
-            target_splits = [s for s in splits if s.startswith("train_fold") or s.startswith("val_fold") or s == "test"]
+    target_splits = [args.split] if args.split else [s for s in splits if s.startswith("train_fold") or s.startswith("val_fold") or s == "test"]
 
     num_classes = infer_num_classes(dataset_cfg)
     base_in_channels = infer_image_channels(dataset_cfg)
@@ -100,19 +73,12 @@ def main() -> None:
         if args.layer == "layer2":
             # Layer2 consumes I* = concat(image, layer1_probs[K,M,H,W] flattened to K*M channels)
             layer1_split_dir = cache_root / "layer1_probs" / dataset_cfg["name"] / split
-            cache_dir = layer1_split_dir if layer1_split_dir.exists() else None
-            if cache_dir is None and split == "test" and not oof_manifest_path.exists():
+            if not layer1_split_dir.exists():
                 raise FileNotFoundError(
-                    f"Missing layer1 probs for test split. Expected either OOF manifest (not applicable for test) or cached layer1_probs at: {layer1_split_dir}. "
-                    f"Run cache_probs with --layer layer1 --split test (and --fold {args.fold}) first."
+                    f"Missing layer1 cache for split '{split}': {layer1_split_dir}. "
+                    f"Run cache_probs with --layer layer1 for the same split first."
                 )
-            ds = Layer2Dataset(
-                base_ds,
-                cache_dir,
-                num_experts=num_experts,
-                num_classes=num_classes,
-                oof_manifest_path=oof_manifest_path if oof_manifest_path.exists() else None,
-            )
+            ds = Layer2Dataset(base_ds, layer1_split_dir, num_experts=num_experts, num_classes=num_classes)
             in_channels = base_in_channels + num_experts * num_classes
         else:
             ds = base_ds
@@ -147,7 +113,7 @@ def main() -> None:
                 with torch.no_grad():
                     logits = model(img_t.to(device))
                     probs = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]  # [M,H,W]
-                probs_k.append(probs.astype(cache_dtype))
+                probs_k.append(probs.astype(np.float16))
 
             stacked = np.stack(probs_k, axis=0)  # [K,M,H,W]
             np.savez_compressed(out_path, probs=stacked)

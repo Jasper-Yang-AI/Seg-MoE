@@ -1,0 +1,15 @@
+# Model definitions (segmentation_models_pytorch)
+
+smp:
+  encoder_weights: "imagenet"
+
+experts:
+  # The 9 experts are the Cartesian product of architectures x backbones.
+  architectures: ["unet", "linknet", "fpn"]
+  backbones: ["vgg16", "resnet34", "resnet101"]
+
+unetpp:
+  enabled: true
+  architecture: "unetplusplus"
+  backbone: "resnet34"
+  pretrained: "imagenet"

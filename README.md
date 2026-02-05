@@ -140,47 +140,49 @@ python scripts/visualize_overlay.py --dataset-config configs/2d/datasets/btcv_sy
 ```bash
 # 小规模快速测试（少量数据+少量 epoch），验证训练/评估/缓存主链路
 # 建议先选 ACDC 或 MSD 的单个数据集跑 fold0
-python scripts/train_2d_experts.py --exp configs/2d/experiment.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --debug configs/2d/debug.yaml --fold 0 --layer layer1 --dataset-config configs/2d/datasets/acdc.yaml
+python scripts/train_2d_experts.py --exp configs/2d/exp/exp_acdc.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --debug configs/2d/debug.yaml --fold 0 --layer layer1
 ```
 
 ### 4. 训练9个专家（Layer1）
 
 ```bash
 # 单数据集训练所有专家（默认 5-fold）
-python scripts/train_2d_experts.py --exp configs/2d/experiment.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --layer layer1 --dataset-config configs/2d/datasets/acdc.yaml
+python scripts/train_2d_experts.py --exp configs/2d/exp/exp_acdc.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --layer layer1 --fold 0
 
 # UNet++ baseline（强单模型）
-python scripts/train_unetpp.py --exp configs/2d/experiment.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --fold 0 --dataset-config configs/2d/datasets/acdc.yaml
+python scripts/train_unetpp.py --exp configs/2d/exp/exp_acdc.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --fold 0
 ```
 
 ### 5. 训练Layer2（基于I*）
 
 ```bash
-# 1) 生成 layer1 概率缓存（float16, npz）
-python scripts/cache_probs.py --exp configs/2d/experiment.yaml --models configs/2d/models.yaml --layer layer1 --dataset-config configs/2d/datasets/acdc.yaml
+# 先生成 Layer1 的 OOF 概率图，再训练 Layer2
 
-# 2) 基于 I* (image + layer1 probs) 训练 layer2 专家
-python scripts/train_layer2.py --exp configs/2d/experiment.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml --dataset-config configs/2d/datasets/acdc.yaml
+# 1) 生成 Layer1 的 OOF 概率图与索引清单（manifest）
+python scripts/generate_layer1_oof.py --exp configs/2d/exp/exp_acdc.yaml --models configs/2d/models.yaml --which best --skip-existing
 
-# 3) 生成 layer2 概率缓存（用于 proposed_2layer 最终融合与评估）
-python scripts/cache_probs.py --exp configs/2d/experiment.yaml --models configs/2d/models.yaml --layer layer2 --dataset-config configs/2d/datasets/acdc.yaml
+# 2) 用 OOF probs 拼接 I* 训练 layer2 专家（train/val 都读 OOF）
+python scripts/train_layer2.py --exp configs/2d/exp/exp_acdc.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --augs configs/2d/augs.yaml
+
+# 3) （可选）生成 layer2 概率缓存（用于 proposed_2layer 最终融合与评估）
+python scripts/cache_probs.py --exp configs/2d/exp/exp_acdc.yaml --models configs/2d/models.yaml --layer layer2 --which best --fold 0
 ```
 
 ### 6. 训练融合器并评估
 
 ```bash
 # 评估单模型/融合/两层方法，并输出每数据集每方法的 CSV
-python scripts/eval_methods.py --exp configs/2d/experiment.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml --dataset-config configs/2d/datasets/acdc.yaml
+python scripts/eval_methods.py --exp configs/2d/exp/exp_acdc.yaml --training configs/2d/training.yaml --models configs/2d/models.yaml
 
 # 导出融合权重表（Table 6 风格）
-python scripts/export_weights.py --exp configs/2d/experiment.yaml
+python scripts/export_weights.py --exp configs/2d/exp/exp_acdc.yaml
 ```
 
 ### 7. 导出论文表格
 
 ```bash
 # 生成论文风格的结果表格（Table 2-6）
-python scripts/export_tables.py --exp configs/2d/experiment.yaml
+python scripts/export_tables.py --exp configs/2d/exp/exp_acdc.yaml
 
 # 输出：
 # - table2_single_models.csv       (9个单模型结果)
