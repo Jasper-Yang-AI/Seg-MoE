@@ -1,4 +1,8 @@
-# Python
+# ============================================================
+# Seg-MoE .gitignore
+# ============================================================
+
+# ---------------------- Python ----------------------
 __pycache__/
 *.py[cod]
 *$py.class
@@ -19,47 +23,87 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+*.pyd
 
-# Virtual environments
+# ---------------------- Virtual envs ----------------------
 venv/
 env/
 ENV/
-.venv
+.venv/
+.conda/
 
-# IDEs
+# ---------------------- IDEs ----------------------
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-.DS_Store
 
-# Jupyter
-.ipynb_checkpoints
+# ---------------------- Jupyter ----------------------
+.ipynb_checkpoints/
 *.ipynb
 
-# Data (too large for git)
+# ---------------------- Data (large files) ----------------------
 data/raw/
 data/processed/
 data/cache/
+# 保留 splits (small JSON/JSONL, 可复现的划分)
+# data/splits/ 已跟踪
 
-# Experiment outputs
+# ---------------------- nnUNet data (generated, very large) ----------------------
+nnunet_data/
+
+# ---------------------- Experiment outputs ----------------------
 runs/
 outputs/
 logs/
 checkpoints/
+
+# ---------------------- Model weights ----------------------
 *.pth
 *.pt
 *.ckpt
+*.onnx
+*.safetensors
 
-# Weights & Biases
+# ---------------------- Cached arrays / tensors ----------------------
+*.npy
+*.npz
+*.b2nd
+*.pkl
+*.h5
+*.hdf5
+
+# ---------------------- Medical imaging ----------------------
+*.nii
+*.nii.gz
+*.dcm
+*.mha
+*.nrrd
+
+# ---------------------- Weights & Biases / MLflow ----------------------
 wandb/
+mlruns/
 
-# Temporary files
+# ---------------------- pytest / coverage ----------------------
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# ---------------------- mypy / type checking ----------------------
+.mypy_cache/
+.pytype/
+
+# ---------------------- Temp / logs ----------------------
 *.log
 *.tmp
 tmp/
+temp/
 
-# OS
+# ---------------------- OS ----------------------
 Thumbs.db
+Desktop.ini
 .DS_Store
+._*
