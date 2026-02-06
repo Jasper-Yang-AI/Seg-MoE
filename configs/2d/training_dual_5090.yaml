@@ -1,0 +1,72 @@
+# ================================================================
+# 双 RTX 5090 最优训练配置 (DataParallel, 2×32GB = 64GB VRAM)
+# ================================================================
+# 用法:
+#   python scripts/train/train_2d_experts.py \
+#     --training configs/2d/training_dual_5090.yaml --gpus 0,1
+#
+# 关键优化:
+#   - BF16 混合精度 (Blackwell 原生支持, 比 FP16 更稳定, 无需 GradScaler 动态调整)
+#   - 全局 bs=32 + grad_accum=2 → 等效 bs=64, 梯度更平稳
+#   - AdamW + Cosine warmup 学习率策略
+#   - 线性缩放 lr: base 1e-4 @ bs=8, 等效 bs=64 → 4e-4
+#
+# 注意: DataParallel batch_size 是全局值, 框架自动平分给各卡.
+# 三专家中 SwinUNETR 显存占用最大, bs=32 全局 (16/卡) @ 256×256 BF16
+# 每卡约占 ~12-16GB, 32GB 显存绰绰有余.
+
+# ---------- 基础超参 ----------
+batch_size: 32          # 全局 batch, 每卡 16 samples
+epochs: 300
+lr: 4.0e-4              # 线性缩放: 1e-4 × (64/8) × 0.5 安全系数
+
+# ---------- 优化器 ----------
+optimizer:
+  name: "adamw"
+  weight_decay: 0.05      # 较强正则, 防止大 batch 过拟合
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+# ---------- 学习率调度 ----------
+scheduler:
+  name: "cosine"
+  min_lr: 1.0e-6          # 余弦退火最低 lr
+  warmup_epochs: 15       # 大 batch 需要更长 warmup
+
+# ---------- 混合精度 ----------
+# RTX 5090 (Blackwell, sm_120) 对 BF16 有原生 Tensor Core 支持:
+#   - BF16 比 FP16 更稳定 (动态范围等同 FP32, 不需要 loss scaling)
+#   - 训练速度与 FP16 相当, 数值稳定性显著更好
+#   - 医学图像标签不平衡场景下 FP16 偶有 loss NaN, BF16 几乎不会
+amp:
+  enabled: true
+  dtype: "bfloat16"       # 强烈推荐. 若遇兼容问题可回退 "float16"
+
+# ---------- 梯度累积 ----------
+# 等效 batch = batch_size × grad_accum = 32 × 2 = 64
+# 大等效 batch 使梯度估计更准, 尤其在类别不平衡的医学分割中收益明显
+gradient_accumulation_steps: 2
+
+# ---------- DataLoader ----------
+dataloader:
+  num_workers: 4          # Windows 下 4 线程通常稳定; 若报错可降为 2
+  pin_memory: true        # CUDA 传输加速
+  prefetch_factor: 3      # 每个 worker 预取 3 个 batch
+
+# ---------- 损失函数 ----------
+loss:
+  name: "ce_plus_dice"
+  dice_smooth: 1.0
+  dice_weight: 1.0
+  ce_weight: 1.0
+
+# ---------- Checkpoint ----------
+checkpoint:
+  save_best: true
+  save_last: true
+  monitor: "val_dice_mean"
+
+# ---------- 日志 ----------
+logging:
+  log_interval: 10        # 每 10 步记录一次 (大 batch 迭代少, 日志更频繁)
+  val_interval: 1         # 每 epoch 验证一次

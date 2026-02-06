@@ -1,0 +1,57 @@
+# SOTA Model Configurations for Seg-MoE
+# Three heterogeneous 3D experts: CNN + Transformer + ResEncoder
+# Default: CT liver (M=3: bg/liver/tumor), patch 96³
+
+sota_experts:
+  # 1. Swin-UNetR (Transformer-based, MONAI)
+  - architecture: "swin_unetr"
+    name: "swin-unetr-base"
+    enabled: true
+    config:
+      spatial_dims: 3
+      feature_size: 48
+      depths: [2, 2, 2, 2]
+      num_heads: [3, 6, 12, 24]
+      use_checkpoint: false
+      # pretrained_path: "path/to/swin_unetr_pretrained.pt"
+
+  # 2. nnUNet v2 (Modern CNN)
+  - architecture: "nnunet"
+    name: "nnunet-v2"
+    enabled: true
+    config:
+      patch_size: [96, 96, 96]
+      n_stages: 6
+      features_per_stage: [32, 64, 128, 256, 320, 320]
+      conv_op: "Conv3d"
+
+  # 3. SegResNet (3D residual encoder-decoder, MONAI)
+  - architecture: "segresnet"
+    name: "segresnet-base"
+    enabled: true
+    config:
+      spatial_dims: 3
+      init_filters: 32
+      blocks_down: [1, 2, 2, 4]
+      blocks_up: [1, 1, 1]
+      dropout_prob: 0.2
+      # pretrained_path: "path/to/segresnet_pretrained.pt"
+
+# Training settings specific to SOTA models
+sota_training:
+  swin_unetr:
+    lr_multiplier: 0.1
+    warmup_epochs: 10
+  nnunet:
+    lr_multiplier: 1.0
+  segresnet:
+    lr_multiplier: 1.0
+    warmup_epochs: 5
+
+# Options for ensemble strategies
+ensemble_strategy:
+  mode: "weighted"    # weighted | voting | stacking
+  init_weights:
+    transformer: 1.0
+    cnn: 1.0
+    resnet: 1.0

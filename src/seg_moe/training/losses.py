@@ -7,14 +7,20 @@ import torch.nn.functional as F
 
 
 def soft_dice_loss(logits: torch.Tensor, target: torch.Tensor, num_classes: int, smooth: float = 1.0) -> torch.Tensor:
-    """Multiclass soft dice.
+    """Multiclass soft dice (supports 2D and 3D).
 
-    logits: [B,C,H,W]
-    target: [B,H,W] int64
+    logits: [B,C,H,W] or [B,C,D,H,W]
+    target: [B,H,W] or [B,D,H,W] int64
     """
     probs = torch.softmax(logits, dim=1)
-    target_1h = F.one_hot(target.clamp(min=0), num_classes=num_classes).permute(0, 3, 1, 2).float()
-    dims = (0, 2, 3)
+    target_1h = F.one_hot(target.clamp(min=0), num_classes=num_classes).float()
+    # Move class dim from last to dim=1: [B,...,C] -> [B,C,...]
+    ndim = target_1h.ndim
+    perm = [0, ndim - 1] + list(range(1, ndim - 1))
+    target_1h = target_1h.permute(*perm)
+    # Sum over batch + spatial dims (all except class)
+    spatial_dims = tuple(range(2, logits.ndim))
+    dims = (0,) + spatial_dims
     intersection = torch.sum(probs * target_1h, dims)
     denom = torch.sum(probs + target_1h, dims)
     dice = (2.0 * intersection + smooth) / (denom + smooth)

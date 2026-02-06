@@ -35,7 +35,7 @@ def load_oof_manifest(manifest_path: str | Path, *, repo_root: Optional[str | Pa
     if not manifest_path.exists():
         raise FileNotFoundError(
             f"Missing OOF manifest: {manifest_path}. "
-            "Run scripts/generate_layer1_oof.py first (or disable use_oof_for_layer2)."
+            "Run scripts/inference/generate_layer1_oof.py first (or disable use_oof_for_layer2)."
         )
 
     rows = load_jsonl(manifest_path)

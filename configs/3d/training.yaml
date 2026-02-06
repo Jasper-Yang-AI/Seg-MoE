@@ -1,0 +1,44 @@
+# 3D Expert Training Configuration
+# For CT liver segmentation (M=3: bg/liver/tumor), patch 96³
+
+lr: 1.0e-4
+epochs: 300
+batch_size: 2
+gradient_accumulation_steps: 2     # effective BS = 4
+
+optimizer:
+  name: "adamw"
+  weight_decay: 1.0e-5
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  name: "cosine"
+  warmup_epochs: 20
+  min_lr: 1.0e-6
+
+amp:
+  enabled: true
+  dtype: "bfloat16"        # 5090 has native bf16
+
+loss:
+  ce_weight: 1.0
+  dice_weight: 1.0
+  dice_smooth: 1.0
+
+checkpoint:
+  monitor: "val_dice_mean"
+
+logging:
+  log_interval: 20
+
+dataloader:
+  num_workers: 4
+  pin_memory: true
+
+# Sliding-window inference (validation)
+sliding_window:
+  roi_size: [96, 96, 96]
+  sw_batch_size: 4
+  overlap: 0.5
+  mode: "gaussian"

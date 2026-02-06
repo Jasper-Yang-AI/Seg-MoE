@@ -1,15 +1,54 @@
-# Model definitions (segmentation_models_pytorch)
+# 2D 三专家配置 (双 RTX 5090 优化版)
+# 用法: --models configs/2d/models.yaml
+#
+# 三专家组合: nnUNet (CNN) + SwinUNETR (Transformer) + SegResNet (ResEncoder)
+# 所有专家统一输出 logits [B, M, H, W]
+#
+# nnUNet 使用官方 nnUNet v2 训练流程 (1000 epochs, SGD, PolyLR, 深度监督)
+# 权重由 import_nnunet_weights.py 导入, Layer1 训练时 --skip-if-done 自动跳过
+#
+# 显存估算 (BF16, 256×256, bs=16/卡):
+#   nnUNet:     ~8GB/卡   (~31M params, deep_supervision)
+#   SwinUNETR:  ~14GB/卡  (~62M params)
+#   SegResNet:  ~5GB/卡   (~8M params)
 
-smp:
-  encoder_weights: "imagenet"
+experts_v2:
+  # Expert A: nnUNet v2 — 官方训练权重 (1000 epochs, SGD, PolyLR, Deep Supervision)
+  #
+  # 网络结构: PlainConvUNet (dynamic_network_architectures, 由 nnUNet 官方团队维护)
+  # 训练方式: pip install nnunetv2 → nnUNetv2_train 命令 → 100% 官方流程
+  # 权重导入: import_nnunet_weights.py 从 nnUNetPlans.json 读取实际架构参数
+  #
+  # 重要: 以下参数是占位符, 运行 import_nnunet_weights.py --update-models-yaml
+  # 会根据 nnUNet plan_and_preprocess 的实际规划结果自动覆盖
+  # (features_per_stage, n_stages, kernel/stride sizes 等由数据集特征决定)
+  - name: "nnunet-2d"
+    type: "nnunet"
+    params:
+      conv_op: "Conv2d"
+      n_stages: 6
+      features_per_stage: [32, 64, 128, 256, 512, 512]
+      patch_size: [256, 256]
+      deep_supervision: true
 
-experts:
-  # The 9 experts are the Cartesian product of architectures x backbones.
-  architectures: ["unet", "linknet", "fpn"]
-  backbones: ["vgg16", "resnet34", "resnet101"]
+  # Expert B: Swin-UNetR — Transformer 分割网络 (MONAI)
+  # use_checkpoint=true: 梯度检查点, 用计算换显存, 可支撑更大 batch
+  - name: "swinunetr-2d"
+    type: "monai_swin_unetr"
+    params:
+      spatial_dims: 2
+      feature_size: 48
+      depths: [2, 2, 2, 2]
+      num_heads: [3, 6, 12, 24]
+      use_checkpoint: true
 
-unetpp:
-  enabled: true
-  architecture: "unetplusplus"
-  backbone: "resnet34"
-  pretrained: "imagenet"
+  # Expert C: SegResNet — 残差编解码分割网络 (MONAI)
+  # init_filters 提升至 48, 增加网络容量
+  - name: "segresnet-2d"
+    type: "monai_segresnet"
+    params:
+      spatial_dims: 2
+      init_filters: 48
+      blocks_down: [1, 2, 2, 4]
+      blocks_up: [1, 1, 1]
+      dropout_prob: 0.2

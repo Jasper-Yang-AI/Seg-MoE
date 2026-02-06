@@ -2,7 +2,7 @@ import numpy as np
 
 
 def test_combiner_shapes_smoke():
-    N, K, M = 50, 9, 4
+    N, K, M = 50, 3, 4
     probs = np.random.RandomState(0).rand(N, K, M).astype(np.float32)
     probs = probs / probs.sum(axis=-1, keepdims=True)
     target = np.random.RandomState(1).randint(0, M, size=(N,)).astype(np.int64)

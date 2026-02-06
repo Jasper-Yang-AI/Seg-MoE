@@ -1,0 +1,184 @@
+#!/usr/bin/env python
+"""
+Setup nnUNet v2 official training environment for MSD datasets.
+
+该脚本完成以下步骤:
+  1. 设置 nnUNet 环境变量 (nnUNet_raw, nnUNet_preprocessed, nnUNet_results)
+  2. 将 MSD 数据集转换为 nnUNet v2 原始格式
+  3. 运行 nnUNet 数据指纹分析 + 预处理 (plan_and_preprocess)
+  4. 打印后续训练命令
+
+Usage:
+    # 默认: Task03_Liver
+    python scripts/nnunet/setup_nnunet_task.py \
+        --msd-dir data/raw/Task03_Liver \
+        --dataset-id 3
+
+    # 自定义 nnUNet 数据目录
+    python scripts/nnunet/setup_nnunet_task.py \
+        --msd-dir data/raw/Task03_Liver \
+        --dataset-id 3 \
+        --nnunet-base nnunet_data
+
+Prerequisites:
+    pip install nnunetv2>=2.2
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def _set_env(base_dir: Path) -> None:
+    """Set nnUNet environment variables."""
+    raw_dir = base_dir / "nnUNet_raw"
+    preprocessed_dir = base_dir / "nnUNet_preprocessed"
+    results_dir = base_dir / "nnUNet_results"
+
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    preprocessed_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    os.environ["nnUNet_raw"] = str(raw_dir)
+    os.environ["nnUNet_preprocessed"] = str(preprocessed_dir)
+    os.environ["nnUNet_results"] = str(results_dir)
+
+    print(f"nnUNet_raw          = {raw_dir}")
+    print(f"nnUNet_preprocessed = {preprocessed_dir}")
+    print(f"nnUNet_results      = {results_dir}")
+
+
+def _check_nnunet_installed() -> bool:
+    """Check if nnUNet v2 is installed."""
+    try:
+        import nnunetv2
+        print(f"nnUNet v2 version: {nnunetv2.__version__}")
+        return True
+    except ImportError:
+        return False
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Setup nnUNet v2 for MSD task")
+    ap.add_argument("--msd-dir", required=True, help="Path to MSD task directory (e.g., data/raw/Task03_Liver)")
+    ap.add_argument("--dataset-id", type=int, required=True, help="nnUNet dataset ID (e.g., 3 for Task03)")
+    ap.add_argument("--nnunet-base", default="nnunet_data", help="Base directory for nnUNet data (default: nnunet_data)")
+    ap.add_argument("--skip-convert", action="store_true", help="Skip MSD conversion (if already converted)")
+    ap.add_argument("--skip-preprocess", action="store_true", help="Skip preprocessing")
+    ap.add_argument("--verify", action="store_true", help="Verify dataset integrity")
+    args = ap.parse_args()
+
+    msd_dir = Path(args.msd_dir).resolve()
+    base_dir = Path(args.nnunet_base).resolve()
+
+    # Step 0: Check nnUNet installation
+    if not _check_nnunet_installed():
+        print("\n❌ nnUNet v2 not installed. Install with:")
+        print("   pip install nnunetv2>=2.2")
+        sys.exit(1)
+
+    if not msd_dir.exists():
+        print(f"\n❌ MSD directory not found: {msd_dir}")
+        print("   Please download MSD Task03_Liver from:")
+        print("   http://medicaldecathlon.com/")
+        sys.exit(1)
+
+    # Step 1: Set environment variables
+    print("\n" + "=" * 60)
+    print("Step 1: Setting nnUNet environment variables")
+    print("=" * 60)
+    _set_env(base_dir)
+
+    # Step 2: Convert MSD to nnUNet format
+    if not args.skip_convert:
+        print("\n" + "=" * 60)
+        print("Step 2: Converting MSD dataset to nnUNet format")
+        print("=" * 60)
+
+        cmd = [
+            sys.executable, "-m", "nnunetv2.dataset_conversion.convert_MSD_dataset",
+            "-i", str(msd_dir),
+            "-overwrite_id", str(args.dataset_id),
+        ]
+        print(f"Running: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=False)
+        if result.returncode != 0:
+            print("❌ MSD conversion failed")
+            sys.exit(1)
+        print("✅ MSD conversion complete")
+    else:
+        print("\n[Skip] MSD conversion")
+
+    # Step 3: Verify dataset (optional)
+    if args.verify:
+        print("\n" + "=" * 60)
+        print("Step 2.5: Verifying dataset integrity")
+        print("=" * 60)
+
+        cmd = [
+            sys.executable, "-m", "nnunetv2.experiment_planning.verify_dataset_integrity",
+            "-d", str(args.dataset_id),
+        ]
+        print(f"Running: {' '.join(cmd)}")
+        subprocess.run(cmd, capture_output=False)
+
+    # Step 4: Plan and preprocess
+    if not args.skip_preprocess:
+        print("\n" + "=" * 60)
+        print("Step 3: Planning and preprocessing (fingerprint → plans → preprocess)")
+        print("=" * 60)
+
+        cmd = [
+            sys.executable, "-m", "nnunetv2.experiment_planning.plan_and_preprocess",
+            "-d", str(args.dataset_id),
+            "--verify_dataset_integrity",
+        ]
+        print(f"Running: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=False)
+        if result.returncode != 0:
+            print("❌ Plan and preprocess failed")
+            sys.exit(1)
+        print("✅ Planning and preprocessing complete")
+    else:
+        print("\n[Skip] Planning and preprocessing")
+
+    # Print training commands
+    dataset_name = f"Dataset{args.dataset_id:03d}"
+    plans_dir = base_dir / "nnUNet_preprocessed" / dataset_name
+    if plans_dir.exists():
+        # Try to find the actual dataset name
+        for d in (base_dir / "nnUNet_raw").iterdir():
+            if d.name.startswith(f"Dataset{args.dataset_id:03d}"):
+                dataset_name = d.name
+                break
+
+    print("\n" + "=" * 60)
+    print("✅ Setup complete! Next steps:")
+    print("=" * 60)
+    print()
+    print("Before running training, set environment variables:")
+    print(f'  $env:nnUNet_raw = "{base_dir / "nnUNet_raw"}"')
+    print(f'  $env:nnUNet_preprocessed = "{base_dir / "nnUNet_preprocessed"}"')
+    print(f'  $env:nnUNet_results = "{base_dir / "nnUNet_results"}"')
+    print()
+    print("# ---- Train nnUNet 2D (all 5 folds) ----")
+    print("# 每折 1000 epochs, SGD + PolyLR, 官方配置")
+    for fold in range(5):
+        print(f"  nnUNetv2_train {args.dataset_id} 2d {fold} --npz")
+    print()
+    print("# 或者单折测试:")
+    print(f"  nnUNetv2_train {args.dataset_id} 2d 0 --npz")
+    print()
+    print("# ---- 训练完成后导入权重到 Seg-MoE ----")
+    print(f"  python scripts/nnunet/import_nnunet_weights.py \\")
+    print(f"    --nnunet-base {args.nnunet_base} \\")
+    print(f"    --dataset-id {args.dataset_id} \\")
+    print(f"    --exp configs/2d/exp/exp_msd_task03_liver.yaml \\")
+    print(f"    --config 2d --folds 0 1 2 3 4")
+
+
+if __name__ == "__main__":
+    main()

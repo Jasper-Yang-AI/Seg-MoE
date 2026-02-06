@@ -12,7 +12,10 @@ setup(
     install_requires=[
         "torch>=2.0.0",
         "torchvision>=0.15.0",
-        "segmentation-models-pytorch>=0.3.3",
+        "monai>=1.3.0",
+        "dynamic-network-architectures>=0.3",
+        "timm>=0.9.0",
+        "einops>=0.7.0",
         "SimpleITK>=2.2.0",
         "nibabel>=5.0.0",
         "pydicom>=2.3.0",
@@ -23,6 +26,8 @@ setup(
         "scipy>=1.10.0",
         "pandas>=2.0.0",
         "pyyaml>=6.0",
+        "omegaconf>=2.3.0",
+        "tensorboard>=2.12.0",
         "tqdm>=4.65.0",
         "matplotlib>=3.7.0",
     ],
@@ -32,17 +37,6 @@ setup(
             "black>=23.3.0",
             "flake8>=6.0.0",
             "isort>=5.12.0",
-        ],
-        "full": [
-            "monai>=1.2.0",
-            "wandb>=0.15.0",
-            "pyswarm>=0.6",
-        ],
-        "sota": [
-            "monai>=1.3.0",
-            "nnunetv2>=2.2",
-            "timm>=0.9.0",
-            "einops>=0.7.0",
         ],
     },
     classifiers=[

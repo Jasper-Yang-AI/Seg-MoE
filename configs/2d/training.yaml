@@ -1,21 +1,27 @@
-# Training defaults matching Dang et al. (Springer 2024)
+# 基础训练配置 (单卡参考 / 论文基线)
+# 双卡5090请使用: training_dual_5090.yaml
 
 batch_size: 8
 epochs: 300
 lr: 1.0e-4
 
 optimizer:
-  name: "adam"
-  weight_decay: 0.0
+  name: "adamw"
+  weight_decay: 0.01
 
 scheduler:
-  name: "none"
+  name: "cosine"
+  min_lr: 1.0e-6
+  warmup_epochs: 10
 
 amp:
-  enabled: false
+  enabled: true
+  dtype: "bfloat16"
+
+gradient_accumulation_steps: 1
 
 dataloader:
-  num_workers: 4
+  num_workers: 2
   pin_memory: true
 
 loss:

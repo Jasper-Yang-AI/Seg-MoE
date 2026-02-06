@@ -87,7 +87,7 @@ class Layer2OOFDataset(Dataset):
         if not prob_path.exists():
             raise FileNotFoundError(
                 f"Missing OOF probability file for sample_id={sample_id}: {prob_path}. "
-                "Run scripts/generate_layer1_oof.py first."
+                "Run scripts/inference/generate_layer1_oof.py first."
             )
         npz = np.load(prob_path)
         probs = npz["probs"].astype(np.float32)  # [K,M,H,W]

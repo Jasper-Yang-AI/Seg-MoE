@@ -14,19 +14,13 @@ dataset:
   name: "msd_task03_liver"
   config: "configs/2d/datasets/msd_task03_liver.yaml"
 
-# Which methods to run in scripts/eval_methods.py and scripts/export_tables.py
+# Which methods to run in scripts/eval/eval_methods.py and scripts/eval/export_tables.py
 methods:
   - single
-  - unetpp
-  - ole9
-  - dt9
+  - mean_ensemble
+  - ole
+  - dt
   - we_clpso
-  - proposed_2layer
-
-experts:
-  architectures: ["unet", "linknet", "fpn"]
-  backbones: ["vgg16", "resnet34", "resnet101"]
-  pretrained: "imagenet"
 
 layering:
   cache_root: "runs/${exp_name}/cache"

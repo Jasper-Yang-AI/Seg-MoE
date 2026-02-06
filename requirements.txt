@@ -1,17 +1,16 @@
-# Deep Learning (torch is intentionally not CUDA-pinned)
-torch>=2.0.0
-torchvision>=0.15.0
-segmentation-models-pytorch>=0.3.3
-
+# Deep Learning
+# RTX 5090 (sm_120) 需要 PyTorch 2.6+ with CUDA 12.8
+# 安装命令: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+torch>=2.6.0
+torchvision>=0.21.0
 # SOTA Models
-monai>=1.3.0              # Swin-UNetR
-nnunetv2>=2.2            # nnUNet v2
-timm>=0.9.0              # Vision Transformer backbones
-einops>=0.7.0            # Tensor operations for transformers
+monai>=1.3.0              # Swin-UNetR + SegResNet
+nnunetv2>=2.2             # nnUNet v2
+dynamic-network-architectures>=0.3  # PlainConvUNet (nnUNet 核心架构)
+timm>=0.9.0               # Vision Transformer backbones
+einops>=0.7.0             # Tensor operations for transformers
 
-# Mamba (optional, requires specific setup)
-# mamba-ssm>=1.0.0       # Uncomment after: pip install causal-conv1d>=1.1.0
-# causal-conv1d>=1.1.0
+# SegResNet 已包含在 MONAI 中，无需额外依赖
 
 # Core
 numpy>=1.24.0
