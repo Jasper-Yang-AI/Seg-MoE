@@ -77,10 +77,10 @@ pip install nnunetv2>=2.2
 
 # ---- Step 1: 数据集转换 + 预处理 (自动设置环境变量) ----
 python scripts/nnunet/setup_nnunet_task.py `
-  --msd-dir data/raw/Task03_Liver `
+  --msd-dir D:\MSD_Dataset/Task03_Liver `
   --dataset-id 3 `
   --nnunet-base nnunet_data `
-  --verify
+  --verify --overwrite
 
 # ---- Step 2: 设置环境变量 (每次新开终端需要) ----
 $env:nnUNet_raw = "$PWD\nnunet_data\nnUNet_raw"
