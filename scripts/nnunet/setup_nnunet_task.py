@@ -55,7 +55,8 @@ def _check_nnunet_installed() -> bool:
     """Check if nnUNet v2 is installed."""
     try:
         import nnunetv2
-        print(f"nnUNet v2 version: {nnunetv2.__version__}")
+        version = getattr(nnunetv2, "__version__", "unknown")
+        print(f"nnUNet v2 version: {version}")
         return True
     except ImportError:
         return False
@@ -67,6 +68,7 @@ def main() -> None:
     ap.add_argument("--dataset-id", type=int, required=True, help="nnUNet dataset ID (e.g., 3 for Task03)")
     ap.add_argument("--nnunet-base", default="nnunet_data", help="Base directory for nnUNet data (default: nnunet_data)")
     ap.add_argument("--skip-convert", action="store_true", help="Skip MSD conversion (if already converted)")
+    ap.add_argument("--overwrite", action="store_true", help="Remove existing dataset dirs before conversion")
     ap.add_argument("--skip-preprocess", action="store_true", help="Skip preprocessing")
     ap.add_argument("--verify", action="store_true", help="Verify dataset integrity")
     args = ap.parse_args()
@@ -98,15 +100,28 @@ def main() -> None:
         print("Step 2: Converting MSD dataset to nnUNet format")
         print("=" * 60)
 
-        cmd = [
-            sys.executable, "-m", "nnunetv2.dataset_conversion.convert_MSD_dataset",
-            "-i", str(msd_dir),
-            "-overwrite_id", str(args.dataset_id),
-        ]
-        print(f"Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=False)
-        if result.returncode != 0:
-            print("❌ MSD conversion failed")
+        # Clean up existing dataset directories for this ID to avoid conflict
+        import shutil
+        ds_prefix = f"Dataset{args.dataset_id:03d}"
+        for parent in ["nnUNet_raw", "nnUNet_preprocessed", "nnUNet_results"]:
+            parent_dir = base_dir / parent
+            if parent_dir.exists():
+                for d in parent_dir.iterdir():
+                    if d.name.startswith(ds_prefix):
+                        if args.overwrite:
+                            print(f"  Removing existing: {d}")
+                            shutil.rmtree(d, ignore_errors=True)
+                        else:
+                            print(f"⚠️  Found existing dataset: {d}")
+                            print(f"   Use --overwrite to remove it, or --skip-convert to skip conversion.")
+                            sys.exit(1)
+
+        try:
+            from nnunetv2.dataset_conversion.convert_MSD_dataset import convert_msd_dataset
+            print(f"Converting: {msd_dir}  →  {ds_prefix}")
+            convert_msd_dataset(str(msd_dir), overwrite_target_id=args.dataset_id)
+        except Exception as e:
+            print(f"❌ MSD conversion failed: {e}")
             sys.exit(1)
         print("✅ MSD conversion complete")
     else:
@@ -117,6 +132,14 @@ def main() -> None:
         print("\n" + "=" * 60)
         print("Step 2.5: Verifying dataset integrity")
         print("=" * 60)
+
+        # Clean up stale *_COMPUTING_* temp folders left by convert_msd_dataset
+        import shutil as _shutil
+        raw_dir = base_dir / "nnUNet_raw"
+        for d in raw_dir.iterdir():
+            if "_COMPUTING_" in d.name and d.is_dir():
+                print(f"  Removing stale temp folder: {d}")
+                _shutil.rmtree(d, ignore_errors=True)
 
         cmd = [
             sys.executable, "-m", "nnunetv2.experiment_planning.verify_dataset_integrity",
@@ -132,7 +155,7 @@ def main() -> None:
         print("=" * 60)
 
         cmd = [
-            sys.executable, "-m", "nnunetv2.experiment_planning.plan_and_preprocess",
+            sys.executable, "-m", "nnunetv2.experiment_planning.plan_and_preprocess_entrypoints",
             "-d", str(args.dataset_id),
             "--verify_dataset_integrity",
         ]
