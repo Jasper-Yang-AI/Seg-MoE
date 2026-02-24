@@ -63,6 +63,10 @@ def main() -> None:
     ap.add_argument("--which", choices=["best", "last"], default="best")
     ap.add_argument("--fold", type=int, default=None)
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--batch-size", type=int, default=32,
+                    help="Inference batch size (default: 32, 2D slices are small)")
+    ap.add_argument("--tta", action="store_true",
+                    help="Enable Test-Time Augmentation (horizontal + vertical flip)")
     ap.add_argument("--skip-existing", action="store_true")
     args = ap.parse_args()
 
@@ -100,54 +104,78 @@ def main() -> None:
         val_rows = [r for r in rows if r.get("split") == val_split]
         fold_dir = ensure_dir(oof_cache_dir / f"fold_{fold}")
 
-        # Check all checkpoints exist
-        ckpt_map = {}
+        # ── Pre-load all expert models for this fold ──
+        ckpt_map: Dict[str, str] = {}
+        expert_models: List[torch.nn.Module] = []
         for ec in expert_cfgs:
             ex = expert_name(ec)
             ckpt = _ckpt_path(run_dir, fold, ex, args.which)
             if not ckpt.exists():
                 raise FileNotFoundError(f"Missing layer1 checkpoint: {ckpt}")
             ckpt_map[ex] = str(ckpt)
+            model = build_expert(ec, in_channels=in_channels, num_classes=num_classes)
+            state = torch.load(ckpt, map_location="cpu", weights_only=True)
+            model.load_state_dict(state["model"], strict=True)
+            model.to(device).eval()
+            print(f"  [fold{fold}] Loaded {ex} from {ckpt}")
+            expert_models.append(model)
 
         ds = SegmentationDataset2D(val_rows, dataset_cfg, augs_cfg=None, is_train=False, limit=args.limit)
-        dl = DataLoader(ds, batch_size=1, shuffle=False)
+        dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
 
-        for img_t, _, meta in tqdm(dl, desc=f"OOF fold{fold}"):
-            sample_id = meta["id"][0] if isinstance(meta["id"], list) else meta["id"]
-            out_path = fold_dir / f"{sample_id}.npz"
-            rel_path = Path(f"fold_{fold}") / f"{sample_id}.npz"
+        for img_batch, _, meta_batch in tqdm(dl, desc=f"OOF fold{fold}"):
+            # img_batch: [B, C, H, W]
+            B = img_batch.shape[0]
+            ids = meta_batch["id"] if isinstance(meta_batch["id"], list) else [meta_batch["id"]]
+            if len(ids) != B:
+                ids = [ids[0]] * B  # fallback for single-element batch
 
-            rec: Dict[str, Any] = {
-                "sample_id": str(sample_id), "sample_fold": int(fold),
-                "predictor_fold": int(fold), "split": val_split,
-                "prob_path": rel_path.as_posix(),
-                "num_classes": int(num_classes),
-                "num_experts": len(expert_cfgs),
-                "experts": list(ckpt_map.keys()),
-                "model_ckpt_paths": dict(ckpt_map),
-                "which": args.which, "seed": int(exp_cfg.get("seed", 0)),
-                "timestamp": ts, "exp_name": str(exp_cfg.get("exp_name")),
-                "dataset": str(dataset_cfg.get("name")),
-            }
-
-            if args.skip_existing and out_path.exists():
-                k = (int(fold), str(sample_id))
-                all_records.append(existing_map.get(k, rec))
-                continue
-
-            probs_k = []
-            for ec in expert_cfgs:
-                ex = expert_name(ec)
-                model = build_expert(ec, in_channels=in_channels, num_classes=num_classes)
-                state = torch.load(Path(ckpt_map[ex]), map_location="cpu")
-                model.load_state_dict(state["model"], strict=True)
-                model.to(device).eval()
+            # ── Collect per-sample expert probs for the entire batch ──
+            batch_expert_probs = []  # List[np.ndarray], each [B, M, H, W]
+            for model in expert_models:
                 with torch.no_grad():
-                    probs = torch.softmax(model(img_t.to(device)), dim=1).detach().cpu().numpy()[0]
-                probs_k.append(probs.astype(cache_dtype))
+                    logits = model(img_batch.to(device))  # [B, M, H, W]
+                    probs = torch.softmax(logits, dim=1)
 
-            np.savez_compressed(out_path, probs=np.stack(probs_k, axis=0))
-            all_records.append(rec)
+                    if args.tta:
+                        # Horizontal flip
+                        logits_h = model(torch.flip(img_batch.to(device), dims=[-1]))
+                        probs_h = torch.softmax(torch.flip(logits_h, dims=[-1]), dim=1)
+                        # Vertical flip
+                        logits_v = model(torch.flip(img_batch.to(device), dims=[-2]))
+                        probs_v = torch.softmax(torch.flip(logits_v, dims=[-2]), dim=1)
+                        probs = (probs + probs_h + probs_v) / 3.0
+
+                    batch_expert_probs.append(probs.cpu().numpy())  # [B, M, H, W]
+
+            # ── Save per-sample ──
+            for b_idx in range(B):
+                sample_id = ids[b_idx]
+                out_path = fold_dir / f"{sample_id}.npz"
+                rel_path = Path(f"fold_{fold}") / f"{sample_id}.npz"
+
+                rec: Dict[str, Any] = {
+                    "sample_id": str(sample_id), "sample_fold": int(fold),
+                    "predictor_fold": int(fold), "split": val_split,
+                    "prob_path": rel_path.as_posix(),
+                    "num_classes": int(num_classes),
+                    "num_experts": len(expert_cfgs),
+                    "experts": list(ckpt_map.keys()),
+                    "model_ckpt_paths": dict(ckpt_map),
+                    "which": args.which, "seed": int(exp_cfg.get("seed", 0)),
+                    "timestamp": ts, "exp_name": str(exp_cfg.get("exp_name")),
+                    "dataset": str(dataset_cfg.get("name")),
+                    "tta": args.tta,
+                }
+
+                if args.skip_existing and out_path.exists():
+                    k = (int(fold), str(sample_id))
+                    all_records.append(existing_map.get(k, rec))
+                    continue
+
+                probs_k = [ep[b_idx].astype(cache_dtype) for ep in batch_expert_probs]
+                np.savez_compressed(out_path, probs=np.stack(probs_k, axis=0))
+                all_records.append(rec)
 
     merged = dict(existing_map)
     for r in all_records:

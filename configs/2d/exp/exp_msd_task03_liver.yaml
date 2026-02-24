@@ -18,16 +18,22 @@ dataset:
 methods:
   - single
   - mean_ensemble
+  - majority_voting
   - ole
   - dt
   - we_clpso
+  - gating
 
 layering:
   cache_root: "runs/${exp_name}/cache"
   cache_dtype: "float16"
   use_oof_for_layer2: true
+  # Layer1 OOF (input to Layer2)
   oof_cache_dir: "runs/${exp_name}/cache/oof/layer1"
   oof_manifest_path: "runs/${exp_name}/cache/oof/layer1/oof_manifest.jsonl"
+  # Layer2 OOF (input to Gating)
+  l2_oof_cache_dir: "runs/${exp_name}/cache/oof/layer2"
+  l2_oof_manifest_path: "runs/${exp_name}/cache/oof/layer2/oof_manifest_layer2.jsonl"
 
 output:
   run_dir: "runs/${exp_name}"

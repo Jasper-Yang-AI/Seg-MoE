@@ -1,11 +1,18 @@
 """
 Layer2 expert training (OOF probabilities from Layer1 -> I* concat -> train).
 
+Optimizations over vanilla stacking (Dang et al. 2024):
+  B1: Layer1 pretrained weights initialize Layer2 (transfer except stem)
+  B2: Dedicated training config (lower LR, shorter schedule)
+  B3: CE + Dice + Boundary Loss (focus on edges & small targets)
+  B4: Per-expert training configs (preserve Layer1 training diversity)
+  B5: Uncertainty channels (entropy + expert disagreement)
+
 Usage:
-    python scripts/train/train_layer2.py \
-        --exp configs/2d/exp/exp_msd_task03_liver.yaml \
-        --training configs/2d/training.yaml \
-        --models configs/2d/models.yaml \
+    python scripts/train/train_layer2.py \\
+        --exp configs/2d/exp/exp_msd_task03_liver.yaml \\
+        --training configs/2d/training_layer2.yaml \\
+        --models configs/2d/models.yaml \\
         --augs configs/2d/augs.yaml --fold 0 --gpus 0,1
 """
 from __future__ import annotations
@@ -19,7 +26,7 @@ from torch.utils.data import DataLoader
 
 from seg_moe.data.indexing import infer_image_channels, infer_num_classes
 from seg_moe.data.layer2_oof_dataset import Layer2OOFDataset
-from seg_moe.models.factory_2d import build_expert, expert_name, list_experts
+from seg_moe.models.factory_2d import build_expert, expert_name, list_experts, transfer_layer1_to_layer2
 from seg_moe.training.engine import train_model
 from seg_moe.utils.config import apply_debug_overrides, load_config, merge_configs, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl
@@ -83,6 +90,10 @@ def main() -> None:
     ap.add_argument("--dataset-config", default=None)
     ap.add_argument("--resume", default="none")
     ap.add_argument("--skip-if-done", action="store_true")
+    ap.add_argument("--no-pretrain", action="store_true",
+                    help="Disable Layer1→Layer2 weight transfer (train from scratch)")
+    ap.add_argument("--no-uncertainty", action="store_true",
+                    help="Disable uncertainty channels (entropy + disagreement)")
     ap.add_argument("--gpus", type=str, default=None)
     ap.add_argument("--amp", action="store_true", default=None)
     ap.add_argument("--num-workers", type=int, default=None)
@@ -129,29 +140,42 @@ def main() -> None:
     base_in = infer_image_channels(dataset_cfg)
     expert_cfgs = list_experts(models_cfg)
     K = len(expert_cfgs)
-    in_channels = base_in + K * num_classes
+
+    # ── B5: Uncertainty channels ──
+    add_uncertainty = not args.no_uncertainty
+    extra_uncertainty_ch = (1 + num_classes) if add_uncertainty else 0  # entropy[1] + disagreement[M]
+    in_channels = base_in + K * num_classes + extra_uncertainty_ch
 
     limits = merged.get("datalimits", {}) or {}
     train_ds = Layer2OOFDataset(
         [r for r in rows if r.get("split") == f"train_fold{fold}"],
         dataset_cfg, oof_manifest_path, expected_num_experts=K,
-        augs_cfg=augs_cfg, is_train=True, limit=limits.get("limit_train_samples"))
+        augs_cfg=augs_cfg, is_train=True, limit=limits.get("limit_train_samples"),
+        add_uncertainty=add_uncertainty)
     val_ds = Layer2OOFDataset(
         [r for r in rows if r.get("split") == f"val_fold{fold}"],
         dataset_cfg, oof_manifest_path, expected_num_experts=K,
-        augs_cfg=augs_cfg, is_train=False, limit=limits.get("limit_val_samples"))
+        augs_cfg=augs_cfg, is_train=False, limit=limits.get("limit_val_samples"),
+        add_uncertainty=add_uncertainty)
 
-    print(f"Layer2 | in_channels={in_channels} (base={base_in} + {K}x{num_classes})")
+    unc_str = f" + uncertainty({extra_uncertainty_ch}ch)" if add_uncertainty else ""
+    print(f"Layer2 | in_channels={in_channels} (base={base_in} + {K}x{num_classes}{unc_str})")
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
 
     bs = int((merged.get("training", {}) or {}).get("batch_size", training_cfg.get("batch_size", 8)))
     epochs = int((merged.get("training", {}) or {}).get("epochs", training_cfg.get("epochs", 300)))
-    training_cfg = {**training_cfg, "batch_size": bs, "epochs": epochs}
 
     nw = int(training_cfg.get("dataloader", {}).get("num_workers", _DEFAULT_NUM_WORKERS))
     pm = bool(training_cfg.get("dataloader", {}).get("pin_memory", True))
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=nw, pin_memory=pm)
     val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=nw, pin_memory=pm)
+
+    # ── B4: Per-expert training overrides ──
+    # training_layer2.yaml can have an `expert_overrides` section:
+    #   expert_overrides:
+    #     nnunet-2d: { optimizer: {name: sgd, ...}, lr: 1e-4, ... }
+    #     swinunetr-2d: { lr: 1e-4, ... }
+    expert_overrides = training_cfg.get("expert_overrides", {}) or {}
 
     for ec in expert_cfgs:
         name = expert_name(ec)
@@ -165,12 +189,42 @@ def main() -> None:
             continue
 
         resume_from = _resolve_resume(args.resume, last_ckpt, best_ckpt)
+
+        # Build Layer2 model
         model = build_expert(ec, in_channels=in_channels, num_classes=num_classes)
+
+        # ── B1: Transfer Layer1 pretrained weights ──
+        if not args.no_pretrain and resume_from is None:
+            l1_ckpt = Path(run_dir) / "checkpoints" / "layer1" / f"fold{fold}" / name / f"{args.which}.pt"
+            if l1_ckpt.exists():
+                l1_model = build_expert(ec, in_channels=base_in, num_classes=num_classes)
+                state = torch.load(l1_ckpt, map_location="cpu", weights_only=True)
+                l1_model.load_state_dict(state["model"], strict=True)
+                transfer_layer1_to_layer2(
+                    l1_model, model,
+                    base_in_channels=base_in,
+                    extra_in_channels=in_channels - base_in,
+                )
+                del l1_model
+            else:
+                print(f"[Layer2] Layer1 checkpoint not found: {l1_ckpt}, training from scratch")
+
         model = _wrap_dp(model, gpu_ids)
+
+        # ── B4: Per-expert training config ──
+        expert_tcfg = {**training_cfg, "batch_size": bs, "epochs": epochs}
+        if name in expert_overrides:
+            overrides = expert_overrides[name]
+            for k, v in overrides.items():
+                if isinstance(v, dict) and isinstance(expert_tcfg.get(k), dict):
+                    expert_tcfg[k] = {**expert_tcfg[k], **v}
+                else:
+                    expert_tcfg[k] = v
+            print(f"[Layer2] Applied expert overrides for {name}: {list(overrides.keys())}")
 
         print(f"Training Layer2: {tag}")
         train_model(model, train_loader, val_loader, num_classes=num_classes,
-                    training_cfg=training_cfg, run_dir=run_dir, tag=tag,
+                    training_cfg=expert_tcfg, run_dir=run_dir, tag=tag,
                     device=device, resume_from=resume_from)
 
 

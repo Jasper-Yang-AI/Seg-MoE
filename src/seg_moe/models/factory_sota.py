@@ -1,11 +1,26 @@
 """
 Factory for building SOTA segmentation models.
 
+.. deprecated::
+    This module is superseded by ``factory_2d.py`` (2D pipeline) and
+    ``experts/factory.py`` (3D pipeline).  It is kept only for backward
+    compatibility with older notebook/scripts.  New code should use
+    ``seg_moe.models.factory_2d.build_expert()`` instead.
+
 Supports:
 - Swin-UNetR (Transformer-based, from MONAI)
 - nnUNet v2 (Modern CNN, extracted architecture)
 - SegResNet (3D residual encoder-decoder, from MONAI)
 """
+import warnings as _warnings
+
+_warnings.warn(
+    "seg_moe.models.factory_sota is deprecated. "
+    "Use seg_moe.models.factory_2d (2D) or "
+    "seg_moe.models.experts.factory (3D) instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 from __future__ import annotations
 
 from typing import Any, Dict, Optional

@@ -29,9 +29,9 @@ def surface_distances_2d(
 ) -> Optional[Dict[str, float]]:
     """Compute symmetric surface distances between two binary masks.
 
-    Assumptions (default, configurable in docs/config):
-    - Boundary extracted by skimage.find_boundaries(mode='outer')
-    - Distances are Euclidean in pixel units unless spacing_yx is provided.
+    References:
+      - Maier-Hein et al. 2024, "Metrics Reloaded", Nature Methods
+      - Nikolov et al. 2021, "Clinically Applicable Segmentation ...", Nature Machine Intelligence
 
     Returns
     -------
@@ -40,6 +40,8 @@ def surface_distances_2d(
       - mad: symmetric average surface distance (ASD)
       - hd: symmetric Hausdorff distance (full)
       - hd95: symmetric 95th percentile Hausdorff
+      - nsd_1: Normalized Surface Dice at τ=1mm (or 1 pixel if no spacing)
+      - nsd_2: Normalized Surface Dice at τ=2mm (or 2 pixels if no spacing)
     """
 
     pred = pred_mask.astype(bool)
@@ -74,4 +76,25 @@ def surface_distances_2d(
     hd = float(all_d.max())
     hd95 = float(np.percentile(all_d, 95))
 
-    return {"mad": mad, "hd": hd, "hd95": hd95}
+    # ── NSD (Normalized Surface Dice) ──
+    # Nikolov et al. 2021; Maier-Hein et al. 2024
+    # NSD(τ) = |{p ∈ ∂P : d(p, ∂T) ≤ τ}| + |{t ∈ ∂T : d(t, ∂P) ≤ τ}|
+    #          / (|∂P| + |∂T|)
+    nsd_1 = _compute_nsd(d_pt, d_tp, tau=1.0)
+    nsd_2 = _compute_nsd(d_pt, d_tp, tau=2.0)
+
+    return {"mad": mad, "hd": hd, "hd95": hd95, "nsd_1": nsd_1, "nsd_2": nsd_2}
+
+
+def _compute_nsd(d_pt: np.ndarray, d_tp: np.ndarray, tau: float) -> float:
+    """Normalized Surface Dice at tolerance τ.
+
+    Fraction of boundary points within distance τ of the other boundary.
+    """
+    n_pt = d_pt.size
+    n_tp = d_tp.size
+    if n_pt + n_tp == 0:
+        return 0.0
+    within_pt = float(np.sum(d_pt <= tau))
+    within_tp = float(np.sum(d_tp <= tau))
+    return (within_pt + within_tp) / (n_pt + n_tp)

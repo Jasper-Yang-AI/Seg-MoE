@@ -65,7 +65,15 @@ def main() -> None:
         print(f"\n--- {fold_key} ---")
         layer1 = data.get("layer1", {})
         for method, weights in layer1.items():
-            if weights is not None:
+            if weights is None:
+                continue
+            if isinstance(weights[0], list):
+                # Per-class weight matrix [K, M]
+                print(f"  {method}:")
+                for n, row in zip(names, weights):
+                    row_str = ", ".join(f"{v:.4f}" for v in row)
+                    print(f"    {n}: [{row_str}]")
+            else:
                 w_str = ", ".join(f"{n}={w:.4f}" for n, w in zip(names, weights))
                 print(f"  {method}: [{w_str}]")
 

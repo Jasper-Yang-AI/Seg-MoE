@@ -28,7 +28,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from seg_moe.evaluation.metrics_2d import compute_segmentation_metrics_batch
-from seg_moe.training.losses import ce_plus_dice
+from seg_moe.training.losses import ce_plus_dice, build_loss_fn
 from seg_moe.utils.io import ensure_dir
 
 
@@ -257,6 +257,10 @@ def train_model(
     print(header)
     flog.info(header)
 
+    # ---- Build loss function (B3: supports ce_dice_boundary via config) ----
+    loss_cfg = training_cfg.get("loss", {})
+    loss_fn = build_loss_fn(loss_cfg, num_classes, ignore_index=ignore_index)
+
     # ---- Training loop ----
     for epoch in range(start_epoch, epochs + 1):
         epoch_t0 = time.time()
@@ -270,14 +274,7 @@ def train_model(
 
             with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
                 logits = model(img)
-                loss = ce_plus_dice(
-                    logits, mask,
-                    num_classes=num_classes,
-                    dice_smooth=float(training_cfg.get("loss", {}).get("dice_smooth", 1.0)),
-                    ce_weight=float(training_cfg.get("loss", {}).get("ce_weight", 1.0)),
-                    dice_weight=float(training_cfg.get("loss", {}).get("dice_weight", 1.0)),
-                    ignore_index=ignore_index,
-                )
+                loss = loss_fn(logits, mask)
                 loss = loss / grad_accum_steps  # 梯度累积: 等效放大 batch
 
             # NaN/Inf 检测
@@ -329,14 +326,7 @@ def train_model(
                 img, mask, _ = _to_device(batch, device)
                 with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
                     logits = model(img)
-                    loss = ce_plus_dice(
-                        logits, mask,
-                        num_classes=num_classes,
-                        dice_smooth=float(training_cfg.get("loss", {}).get("dice_smooth", 1.0)),
-                        ce_weight=float(training_cfg.get("loss", {}).get("ce_weight", 1.0)),
-                        dice_weight=float(training_cfg.get("loss", {}).get("dice_weight", 1.0)),
-                        ignore_index=ignore_index,
-                    )
+                    loss = loss_fn(logits, mask)
                 val_losses.append(float(loss.item()))
                 probs = torch.softmax(logits, dim=1)
                 val_metrics_accum.append(compute_segmentation_metrics_batch(probs, mask, num_classes=num_classes))

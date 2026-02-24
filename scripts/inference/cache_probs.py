@@ -77,6 +77,20 @@ def main() -> None:
     expert_cfgs = list_experts(models_cfg)
     expert_names = [expert_name(ec) for ec in expert_cfgs]
 
+    # ── Pre-load all expert models (outside the sample loop) ──
+    expert_models: list[torch.nn.Module] = []
+    for ec in expert_cfgs:
+        ex = expert_name(ec)
+        ckpt = _ckpt_path(run_dir, args.layer, args.fold, ex, which=args.which)
+        if not ckpt.exists():
+            raise FileNotFoundError(f"Missing checkpoint: {ckpt}")
+        model = build_expert(ec, in_channels=in_channels, num_classes=num_classes)
+        state = torch.load(ckpt, map_location="cpu", weights_only=True)
+        model.load_state_dict(state["model"], strict=True)
+        model.to(device).eval()
+        print(f"  Loaded {ex} from {ckpt}")
+        expert_models.append(model)
+
     for split in target_splits:
         split_rows = [r for r in rows if r.get("split") == split]
         ds = SegmentationDataset2D(split_rows, dataset_cfg, augs_cfg=None, is_train=False)
@@ -85,11 +99,6 @@ def main() -> None:
         split_dir = out_root / split
         ensure_dir(split_dir)
 
-        for ex_name in expert_names:
-            ckpt = _ckpt_path(run_dir, args.layer, args.fold, ex_name, which=args.which)
-            if not ckpt.exists():
-                raise FileNotFoundError(f"Missing checkpoint: {ckpt}")
-
         for img_t, _, meta in tqdm(dl, desc=f"cache {args.layer} {split}"):
             sample_id = meta["id"][0] if isinstance(meta["id"], list) else meta["id"]
             out_path = split_dir / f"{sample_id}.npz"
@@ -97,13 +106,7 @@ def main() -> None:
                 continue
 
             probs_k = []
-            for ec in expert_cfgs:
-                ex = expert_name(ec)
-                ckpt = _ckpt_path(run_dir, args.layer, args.fold, ex, which=args.which)
-                model = build_expert(ec, in_channels=in_channels, num_classes=num_classes)
-                state = torch.load(ckpt, map_location="cpu")
-                model.load_state_dict(state["model"], strict=True)
-                model.to(device).eval()
+            for model in expert_models:
                 with torch.no_grad():
                     logits = model(img_t.to(device))
                     probs = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]

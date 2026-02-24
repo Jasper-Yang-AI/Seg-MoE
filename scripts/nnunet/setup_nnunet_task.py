@@ -123,6 +123,14 @@ def main() -> None:
         except Exception as e:
             print(f"❌ MSD conversion failed: {e}")
             sys.exit(1)
+
+        # Clean up stale *_COMPUTING_* temp folders left by convert_msd_dataset
+        raw_dir = base_dir / "nnUNet_raw"
+        for d in raw_dir.iterdir():
+            if "COMPUTING" in d.name and d.is_dir():
+                print(f"  Removing stale temp folder: {d}")
+                shutil.rmtree(d, ignore_errors=True)
+
         print("✅ MSD conversion complete")
     else:
         print("\n[Skip] MSD conversion")

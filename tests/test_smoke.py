@@ -19,7 +19,9 @@ def test_combiner_shapes_smoke():
     dt = DecisionTemplateCombiner()
     dt.fit(probs, target, num_classes=M)
     pred = dt.predict(probs)
-    assert pred.shape == (N,)
+    assert pred.shape == (N, M), f"DT predict should return soft scores [N,M], got {pred.shape}"
+    pred_hard = dt.predict_hard(probs)
+    assert pred_hard.shape == (N,), f"DT predict_hard should return [N], got {pred_hard.shape}"
 
     from seg_moe.combiners.we_clpso import WECLPSOCombiner
 
@@ -41,3 +43,14 @@ def test_combiner_shapes_smoke():
     seg2 = predict(probs, W_nnls)
     assert scores2.shape == (N, M)
     assert seg2.shape == (N,)
+
+    # --- Majority Voting ---
+    from seg_moe.combiners.majority_voting import MajorityVotingCombiner
+
+    mv = MajorityVotingCombiner()
+    mv.fit(probs, target, num_classes=M)
+    mv_soft = mv.predict(probs)
+    assert mv_soft.shape == (N, M), f"MV predict should return [N,M], got {mv_soft.shape}"
+    assert np.allclose(mv_soft.sum(axis=-1), 1.0, atol=1e-5), "MV predict should be normalized"
+    mv_hard = mv.predict_hard(probs)
+    assert mv_hard.shape == (N,), f"MV predict_hard should return [N], got {mv_hard.shape}"

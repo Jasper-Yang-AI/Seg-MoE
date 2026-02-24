@@ -25,7 +25,11 @@ class Layer2OOFDataset(Dataset):
     The OOF probabilities are expected to be stored as npz with key 'probs':
       probs shape [K, M, H, W] (experts x classes x height x width)
 
-    The model input becomes:
+    The model input becomes (with uncertainty channels enabled):
+      x = concat([image[C,H,W], probs_flat[K*M,H,W],
+                  entropy[1,H,W], disagreement[M,H,W]], dim=0)
+
+    Without uncertainty channels (legacy mode):
       x = concat([image[C,H,W], probs_flat[K*M,H,W]], dim=0)
     """
 
@@ -39,6 +43,7 @@ class Layer2OOFDataset(Dataset):
         augs_cfg: Optional[Dict[str, Any]] = None,
         is_train: bool = False,
         limit: Optional[int] = None,
+        add_uncertainty: bool = False,
     ) -> None:
         self.samples = samples[: (limit or len(samples))]
         self.dataset_cfg = dataset_cfg
@@ -46,6 +51,7 @@ class Layer2OOFDataset(Dataset):
         self.image_channels = int(dataset_cfg["input"].get("image_channels", 3))
         self.label_map = {int(k): int(v) for k, v in dataset_cfg["task"].get("label_map", {}).items()}
         self.expected_num_experts = int(expected_num_experts) if expected_num_experts is not None else None
+        self.add_uncertainty = add_uncertainty
 
         self.oof_map = load_oof_manifest(oof_manifest_path)
 
@@ -135,7 +141,29 @@ class Layer2OOFDataset(Dataset):
         probs_chw = np.transpose(probs_flat.astype(np.float32), (2, 0, 1))
         probs_t = torch.from_numpy(probs_chw).float()
 
-        x = torch.cat([img_t, probs_t], dim=0)
+        # ── Uncertainty channels (B5: entropy + expert disagreement) ──
+        uncertainty_parts = []
+        if self.add_uncertainty:
+            # Recompute from original probs [K,M,H,W] (before augmentation reshape)
+            # Note: spatial augmentation was applied to probs_flat in HWC format;
+            # we need to re-derive K,M from the augmented flat channels
+            probs_km = probs_chw.reshape(k, m, probs_chw.shape[1], probs_chw.shape[2])
+
+            # 1) Mean expert entropy: H = -Σ_m p_m log(p_m), averaged over K experts
+            #    Shape: [1, H, W]
+            eps = 1e-8
+            mean_probs = probs_km.mean(axis=0)  # [M, H, W]
+            entropy = -(mean_probs * np.log(mean_probs + eps)).sum(axis=0, keepdims=True)  # [1,H,W]
+            # Normalize to [0, 1] by dividing by log(M)
+            entropy = entropy / (np.log(m) + eps)
+            uncertainty_parts.append(torch.from_numpy(entropy.astype(np.float32)))
+
+            # 2) Expert disagreement: std across experts per class
+            #    Shape: [M, H, W]
+            disagreement = probs_km.std(axis=0)  # [M, H, W]
+            uncertainty_parts.append(torch.from_numpy(disagreement.astype(np.float32)))
+
+        x = torch.cat([img_t, probs_t] + uncertainty_parts, dim=0)
         mask_t = torch.from_numpy(mask.astype(np.int64))
 
         rec = self.oof_map.get(str(sample_id))

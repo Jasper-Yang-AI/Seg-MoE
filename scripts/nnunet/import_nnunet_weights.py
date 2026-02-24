@@ -242,23 +242,30 @@ def _build_wrapper_and_load(
     for k, v in network_weights.items():
         prefixed_weights[f"model.{k}"] = v
 
-    # Load with strict=False first to see mismatches, then strict=True
+    # Load with strict=False to diagnose mismatches first
     info = wrapper.load_state_dict(prefixed_weights, strict=False)
     if info.missing_keys:
-        print(f"  Missing keys ({len(info.missing_keys)}):")
+        print(f"  ❌ Missing keys ({len(info.missing_keys)}):")
         for k in info.missing_keys[:10]:
             print(f"    - {k}")
         if len(info.missing_keys) > 10:
             print(f"    ... and {len(info.missing_keys) - 10} more")
+        raise RuntimeError(
+            f"Weight import incomplete: {len(info.missing_keys)} missing keys. "
+            "Architecture mismatch between nnUNet checkpoint and wrapper. "
+            "Check that nnUNetPlans params (n_stages, features_per_stage, etc.) "
+            "are correctly extracted."
+        )
     if info.unexpected_keys:
-        print(f"  Unexpected keys ({len(info.unexpected_keys)}):")
+        print(f"  ⚠️ Unexpected keys ({len(info.unexpected_keys)}) — ignored:")
         for k in info.unexpected_keys[:10]:
             print(f"    - {k}")
         if len(info.unexpected_keys) > 10:
             print(f"    ... and {len(info.unexpected_keys) - 10} more")
 
-    if not info.missing_keys and not info.unexpected_keys:
-        print("  All weights loaded successfully (strict match)")
+    # Re-load with strict=True to guarantee exact match (no missing keys)
+    wrapper.load_state_dict(prefixed_weights, strict=True)
+    print("  ✅ All weights loaded successfully (strict match)")
 
     return wrapper
 

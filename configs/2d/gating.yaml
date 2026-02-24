@@ -1,0 +1,66 @@
+# ── Patch-Level 门控网络配置 ──
+# Seg-MoE 课题核心: Layer2 概率图 → Patch → Gating Network → 动态融合
+#
+# 正确流程: Layer1 → L1 OOF → Layer2 → L2 OOF → Gating → Eval
+# 门控网络输入 = Layer2 专家的 OOF 概率图 [K, M, H, W] (非 Layer1!)
+#
+# 参考:
+#   - Shazeer et al. 2017 "Outrageously Large Neural Networks" (MoE gating)
+#   - Riquelme et al. 2021 "Scaling Vision with Sparse MoE" (V-MoE)
+#
+# 双卡 RTX 5090 最优配置 (DataParallel, 无 DDP)
+
+gating:
+  # ── 网络架构 ──
+  hidden_dim: 64              # Conv 通道数 (~25K params total)
+  dropout: 0.1
+  per_class: false            # true = [K,M] per-class per-expert; false = [K] per-expert
+
+  # ── Patch 参数 (256×256 图像) ──
+  patch_size: 64              # 每 patch 64×64
+  stride: 32                  # 50% 重叠 → 7×7 = 49 patches/image
+  blend_mode: "gaussian"      # 合并模式: "gaussian" (推荐) / "average"
+
+  # ── 温度退火 (softmax temperature) ──
+  temperature_start: 2.0      # 初期: 均匀探索, 让所有专家贡献
+  temperature_end: 0.5        # 后期: 锐化选择, 突出最优专家
+
+  # ── 负载平衡正则化 ──
+  load_balance_weight: 0.01   # λ_lb, 防止一个专家主导所有 patch (Shazeer 2017)
+
+training:
+  batch_size: 512             # patch 级别 batch (512 patches ≈ 72MB 输入)
+  epochs: 50                  # 门控网络轻量, 50 epochs 足够收敛
+  lr: 1.0e-3
+
+  optimizer:
+    name: "adamw"
+    weight_decay: 0.01
+
+  scheduler:
+    name: "cosine"
+    min_lr: 1.0e-6
+    warmup_epochs: 5
+
+  amp:
+    enabled: true
+    dtype: "bfloat16"         # 5090 Blackwell 原生支持
+
+  loss:
+    name: "ce_plus_dice"      # 融合预测 vs GT 的端到端监督
+    dice_smooth: 1.0
+    ce_weight: 1.0
+    dice_weight: 1.0
+
+  dataloader:
+    num_workers: 4            # Windows 推荐 2-4
+    pin_memory: true
+
+  checkpoint:
+    save_best: true
+    save_last: true
+    monitor: "val_dice"
+
+  logging:
+    log_interval: 50
+    val_interval: 1

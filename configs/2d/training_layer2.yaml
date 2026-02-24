@@ -1,0 +1,80 @@
+# ── Layer2 训练配置 ──
+# 相比 Layer1 训练 (training.yaml):
+#   - 学习率更低 (4e-5 vs 1e-4)，防止覆盖 Layer1 迁移权重
+#   - 训练轮次更短 (100 vs 300)，避免过拟合
+#   - 使用 Boundary Loss 提升边缘精度 (Kervadec et al. MIDL 2019)
+#   - 支持 B4 per-expert 训练配置覆盖
+
+batch_size: 8
+epochs: 100
+lr: 4.0e-5
+
+optimizer:
+  name: "adamw"
+  weight_decay: 0.01
+
+scheduler:
+  name: "cosine"
+  min_lr: 1.0e-7
+  warmup_epochs: 5
+
+amp:
+  enabled: true
+  dtype: "bfloat16"
+
+gradient_accumulation_steps: 1
+
+dataloader:
+  num_workers: 2
+  pin_memory: true
+
+loss:
+  name: "ce_dice_boundary"
+  dice_smooth: 1.0
+  dice_weight: 1.0
+  ce_weight: 1.0
+  boundary_weight: 0.5
+
+checkpoint:
+  save_best: true
+  save_last: true
+  monitor: "val_dice_mean"
+
+logging:
+  log_interval: 20
+  val_interval: 1
+
+# ── B4: Per-expert training overrides ──
+# 按照各 expert 的官方训练 recipe 做差分化配置
+# key = expert name (对应 models.yaml 中的 name 字段)
+expert_overrides:
+  nnunet-2d:
+    optimizer:
+      name: "sgd"
+      momentum: 0.99
+      nesterov: true
+      weight_decay: 3.0e-5
+    lr: 1.0e-4
+    scheduler:
+      name: "poly"
+      poly_power: 0.9
+
+  swinunetr-2d:
+    optimizer:
+      name: "adamw"
+      weight_decay: 1.0e-5
+    lr: 1.0e-5
+    scheduler:
+      name: "cosine"
+      min_lr: 1.0e-7
+      warmup_epochs: 10
+
+  segresnet-2d:
+    optimizer:
+      name: "adamw"
+      weight_decay: 1.0e-5
+    lr: 2.0e-5
+    scheduler:
+      name: "cosine"
+      min_lr: 1.0e-7
+      warmup_epochs: 5

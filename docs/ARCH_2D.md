@@ -12,23 +12,26 @@
 |------|---------|------|
 | 数据准备 | `scripts/data/prepare_msd.py` | NIfTI → 2D PNG 切片 |
 | Splits | `scripts/data/make_splits.py` | 5-fold 交叉验证索引 |
-| 训练专家 | `scripts/train/train_2d_experts.py` | 按配置循环训练所有专家 |
+| nnUNet 官方训练 | `nnUNetv2_train` + `scripts/nnunet/import_nnunet_weights.py` | 官方流程训练 + 权重导入 |
+| SwinUNETR 官方训练 | `scripts/monai/train_swinunetr_official.py` + `import_swinunetr_weights.py` | MONAI Recipe 训练 + 权重导入 |
+| SegResNet 官方训练 | `scripts/monai/train_segresnet_official.py` + `import_segresnet_weights.py` | MONAI Auto3DSeg Recipe 训练 + 权重导入 |
+| 训练专家 | `scripts/train/train_2d_experts.py` | Layer1 验证 (所有专家已官方训练, --skip-if-done 跳过) |
 | 缓存概率 | `scripts/inference/cache_probs.py` | 推理每个专家，存 `[K,M,H,W]` npz |
 | OOF 概率 | `scripts/inference/generate_layer1_oof.py` | 生成 Layer1 OOF 概率图 |
 | Layer2 训练 | `scripts/train/train_layer2.py` | 基于 I* = 原图 + Layer1 概率图 |
-| 评估融合 | `scripts/eval/eval_methods.py` | 单模型 + mean-ensemble + OLE/DT/WE |
-| 导出表格 | `scripts/eval/export_tables.py` | 汇总 CSV → LaTeX |
+| 评估融合 | `scripts/eval/eval_methods.py` | Layer1/2 + Mean/MV/OLE/DT/WE + Gating + Wilcoxon |
+| 导出表格 | `scripts/eval/export_tables.py` | 汇总 CSV / LaTeX / 统计显著性 |
 | 导出权重 | `scripts/eval/export_weights.py` | 融合器权重导出 |
 | 可视化 | `scripts/eval/visualize_overlay.py` | 预测叠加原图 |
 | Sanity | `scripts/utils/sanity_experts_2d.py` | 随机张量前向检查 shape |
 
 ## 三专家组合
 
-| 角色 | 名称 | 类型 | 实现 |
+| 角色 | 名称 | 类型 | 实现 | 训练方式 |
 |------|------|------|------|
-| Expert A (CNN) | `nnunet-2d` | nnUNet v2 PlainConvUNet | `dynamic_network_architectures` |
-| Expert B (Transformer) | `swinunetr-2d` | Swin-UNetR 2D | `monai.networks.nets.SwinUNETR` |
-| Expert C (ResEncoder) | `segresnet-2d` | SegResNet 2D | `monai.networks.nets.SegResNet` |
+| Expert A (CNN) | `nnunet-2d` | nnUNet v2 PlainConvUNet | `dynamic_network_architectures` | **官方 nnUNet** (1000 ep, SGD, PolyLR) |
+| Expert B (Transformer) | `swinunetr-2d` | Swin-UNetR 2D | `monai.networks.nets.SwinUNETR` | **官方 MONAI Recipe** (300 ep, AdamW 1e-4, WarmupCosine) |
+| Expert C (ResEncoder) | `segresnet-2d` | SegResNetDS 2D | `monai.networks.nets.SegResNetDS` | **官方 MONAI Auto3DSeg** (300 ep, AdamW 2e-4, DeepSupervision) |
 
 三专家统一输出 logits shape: `[B, M, H, W]`（M = 类别数）
 
@@ -51,12 +54,13 @@
 | 模块 | 文件 | 说明 |
 |------|------|------|
 | 统一模型工厂 | `src/seg_moe/models/factory_2d.py` | `build_expert()` / `list_experts()` / `expert_name()` |
-| MONAI SOTA | `src/seg_moe/models/factory_sota.py` | SwinUNETR / SegResNet 底层构建 |
+| 3D 专家工厂 | `src/seg_moe/models/experts/factory.py` | `ExpertFactory` 3D 专家注册与构建 |
+| ~~MONAI SOTA~~ | ~~`src/seg_moe/models/factory_sota.py`~~ | (已废弃, 功能已合并至 factory_2d 和 experts/factory) |
 | nnUNet wrapper | `src/seg_moe/models/wrappers/nnunet_wrapper.py` | PlainConvUNet 封装 |
 | 训练引擎 | `src/seg_moe/training/engine.py` | DP 多卡 + AMP + checkpoint |
 | 数据集 | `src/seg_moe/data/dataset_2d.py` | 2D PNG 分割数据集 |
-| 指标 | `src/seg_moe/evaluation/metrics_2d.py` | Dice / IoU / HD / MAD |
-| 融合器 | `src/seg_moe/combiners/` | OLE / DT / WE-CLPSO |
+| 指标 | `src/seg_moe/evaluation/metrics_2d.py` | Per-class Dice/IoU/HD95/NSD/ASD/Sens/Prec |
+| 融合器 | `src/seg_moe/combiners/` | MajorityVoting / OLE / DT / WE-CLPSO |
 
 ### 目录约定
 
@@ -76,11 +80,16 @@ runs/<exp_name>/
 │   └── oof/
 │       └── layer1/                 OOF 概率图
 ├── results/
-│   └── metrics_*.csv               每方法 Dice/IoU
+│   ├── metrics_*.csv               per-method 聚合指标
+│   ├── metrics_per_sample_*.csv    per-sample 指标 (统计检验用)
+│   └── significance_*.csv          Wilcoxon signed-rank p-values
 ├── tables/
-│   ├── table1_single_experts.csv
-│   ├── table2_ensemble_methods.csv
-│   ├── table3_all_methods.csv
+│   ├── table1_L1_experts.csv       Layer1 单专家
+│   ├── table2_L2_experts.csv       Layer2 单专家
+│   ├── table3_ensemble_methods.csv 集成方法
+│   ├── table4_all_methods.csv      全方法汇总
+│   ├── table_summary_mean_std.csv  5-fold mean±std
+│   ├── table_significance.csv      统计显著性
 │   └── expert_weights.json
 └── logs/
     └── layer1/
@@ -95,8 +104,18 @@ runs/<exp_name>/
 - `scripts/data/make_splits.py` — 生成 5-fold splits
 - `scripts/data/check_labels.py` — 标签审计
 
+### nnunet（nnUNet 官方训练集成）
+- `scripts/nnunet/setup_nnunet_task.py` — 数据集转换 + 预处理
+- `scripts/nnunet/import_nnunet_weights.py` — nnUNet 官方权重导入
+
+### monai（MONAI 官方训练集成）
+- `scripts/monai/train_swinunetr_official.py` — SwinUNETR 官方 MONAI Recipe 训练
+- `scripts/monai/import_swinunetr_weights.py` — SwinUNETR 官方权重导入
+- `scripts/monai/train_segresnet_official.py` — SegResNet 官方 MONAI Auto3DSeg Recipe 训练
+- `scripts/monai/import_segresnet_weights.py` — SegResNet 官方权重导入
+
 ### train（训练）
-- `scripts/train/train_2d_experts.py` — Layer1 三专家训练
+- `scripts/train/train_2d_experts.py` — Layer1 验证 (所有专家已官方训练, --skip-if-done 跳过)
 - `scripts/train/train_layer2.py` — Layer2 训练
 - `scripts/train/train_expert_3d.py` — 3D 专家训练
 
@@ -105,8 +124,8 @@ runs/<exp_name>/
 - `scripts/inference/generate_layer1_oof.py` — OOF 概率图生成
 
 ### eval（评估与导出）
-- `scripts/eval/eval_methods.py` — 单模型 + ensemble 评估
-- `scripts/eval/export_tables.py` — 汇总导出
+- `scripts/eval/eval_methods.py` — L1/L2 单模型 + 集成 + Gating + Wilcoxon 统计检验
+- `scripts/eval/export_tables.py` — 多表汇总 (per-class / significance / mean±std)
 - `scripts/eval/export_weights.py` — 融合器权重导出
 - `scripts/eval/visualize_overlay.py` — 分割可视化
 
