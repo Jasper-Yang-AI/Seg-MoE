@@ -1,13 +1,18 @@
 # ============================================================
-# Seg-MoE .gitignore
+# Seg-MoE .gitignore — 2D/3D 医学图像分割 MoE 项目
 # ============================================================
 
-# ---------------------- Python ----------------------
+# ======================== Python ========================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.pyd
 .Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Build / packaging
 build/
 develop-eggs/
 dist/
@@ -23,87 +28,126 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-*.pyd
+*.manifest
+*.spec
+MANIFEST
 
-# ---------------------- Virtual envs ----------------------
+# ======================== Virtual envs ========================
 venv/
 env/
 ENV/
 .venv/
 .conda/
+conda-meta/
 
-# ---------------------- IDEs ----------------------
+# ======================== IDEs / Editors ========================
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+.settings/
 
-# ---------------------- Jupyter ----------------------
+# ======================== Jupyter ========================
 .ipynb_checkpoints/
 *.ipynb
 
-# ---------------------- Data (large files) ----------------------
+# ======================== Data (large / generated) ========================
+# 原始与处理后的医学影像切片 (GB 级)
 data/raw/
 data/processed/
 data/cache/
 # 保留 splits (small JSON/JSONL, 可复现的划分)
-# data/splits/ 已跟踪
+!data/splits/
 
-# ---------------------- nnUNet data (generated, very large) ----------------------
+# nnUNet 官方流程生成的数据 (极大)
 nnunet_data/
 
-# ---------------------- Experiment outputs ----------------------
+# ======================== Experiment outputs ========================
+# 训练产物: checkpoints, logs, cache, results, tables
 runs/
 outputs/
 logs/
 checkpoints/
+tensorboard/
 
-# ---------------------- Model weights ----------------------
+# ======================== Model weights ========================
 *.pth
 *.pt
 *.ckpt
 *.onnx
 *.safetensors
+*.bin
 
-# ---------------------- Cached arrays / tensors ----------------------
+# ======================== Cached arrays / tensors ========================
 *.npy
 *.npz
 *.b2nd
 *.pkl
+*.pickle
+*.joblib
 *.h5
 *.hdf5
 
-# ---------------------- Medical imaging ----------------------
+# ======================== Medical imaging formats ========================
 *.nii
 *.nii.gz
 *.dcm
 *.mha
+*.mhd
 *.nrrd
+*.raw
+*.zraw
 
-# ---------------------- Weights & Biases / MLflow ----------------------
+# ======================== Experiment tracking ========================
 wandb/
 mlruns/
+lightning_logs/
+*.wandb
 
-# ---------------------- pytest / coverage ----------------------
+# ======================== Testing / Coverage ========================
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
 .tox/
 .nox/
+coverage.xml
+*.cover
 
-# ---------------------- mypy / type checking ----------------------
+# ======================== Type checking / Linting ========================
 .mypy_cache/
 .pytype/
+.ruff_cache/
+.pylint.d/
 
-# ---------------------- Temp / logs ----------------------
+# ======================== Temp / Logs ========================
 *.log
 *.tmp
+*.bak
+*.orig
 tmp/
 temp/
+.cache/
 
-# ---------------------- OS ----------------------
+# ======================== OS ========================
+# Windows
 Thumbs.db
 Desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# macOS
 .DS_Store
 ._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# Linux
+*~
+.directory
