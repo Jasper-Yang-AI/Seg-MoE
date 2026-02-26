@@ -1,0 +1,6 @@
+{
+  "type": "train_5fold_test_fixed",
+  "folds": 5,
+  "seed": 42,
+  "group_key": "patient_id"
+}

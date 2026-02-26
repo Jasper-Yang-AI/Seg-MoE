@@ -118,6 +118,7 @@ def main() -> None:
 
     if info.unexpected_keys:
         # Expected: deep supervision head keys from training (dsdepth>1)
+        # Extra DS keys in dsdepth=2 training ckpt: up_layers.N.head.{weight,bias}
         ds_keys = [k for k in info.unexpected_keys if "ds_head" in k or "up_layers" in k]
         other_keys = [k for k in info.unexpected_keys if k not in ds_keys]
         if ds_keys:

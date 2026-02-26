@@ -21,17 +21,19 @@ def _build_monai_swin_unetr_2d(in_channels: int, classes: int, params: Dict[str,
     import inspect
     valid_params = set(inspect.signature(SwinUNETR.__init__).parameters.keys())
 
+    # img_size was removed in MONAI 1.3+; patch_size replaced it (default=2)
     kwargs = {
         "in_channels": in_channels,
         "out_channels": classes,
         "spatial_dims": params.get("spatial_dims", 2),
         "feature_size": params.get("feature_size", 48),
+        "patch_size": params.get("patch_size", 2),
         "depths": params.get("depths", [2, 2, 2, 2]),
         "num_heads": params.get("num_heads", [3, 6, 12, 24]),
         "use_checkpoint": params.get("use_checkpoint", False),
     }
 
-    # img_size exists in older MONAI, removed in newer versions
+    # Guard: img_size exists in very old MONAI (<1.3), pass it if present in params
     if "img_size" in valid_params and "img_size" in params:
         kwargs["img_size"] = tuple(params["img_size"])
 

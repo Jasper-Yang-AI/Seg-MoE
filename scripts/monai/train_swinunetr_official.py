@@ -41,8 +41,15 @@ import argparse
 import json
 import os
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List
+
+# ── Suppress Windows-specific noise warnings ──
+# PyTorch Windows builds exclude NCCL; DataParallel still works via shared memory.
+warnings.filterwarnings("ignore", message=".*NCCL.*")
+# nll_loss2d has no deterministic CUDA path; suppress warn_only chatter during training.
+warnings.filterwarnings("ignore", message=".*nll_loss2d.*deterministic.*")
 
 import cv2
 import numpy as np
@@ -80,7 +87,9 @@ class _SwinUNETRDataset(Dataset):
     """2D PNG segmentation dataset for MONAI-style training.
 
     Normalisation pipeline matches Seg-MoE inference exactly:
-        grayscale uint8 → float [0,1] → replicate to 3ch → ImageNet norm
+      - RGB input (multi-modal, e.g. prostate):  RGB uint8 → float [0,1] → ImageNet norm
+      - Grayscale input (single-modal, e.g. CT): grayscale uint8 → float [0,1] → replicate to 3ch → ImageNet norm
+    Auto-detects from dataset_cfg["input"]["image_channels"].
     """
 
     def __init__(
@@ -92,6 +101,7 @@ class _SwinUNETRDataset(Dataset):
         self.rows = rows
         self.label_map = dataset_cfg.get("task", {}).get("label_map")
         self.image_size = tuple(dataset_cfg.get("input", {}).get("image_size", [256, 256]))
+        self.image_channels = int(dataset_cfg.get("input", {}).get("image_channels", 1))
         self.transforms = monai_transforms
 
     def __len__(self) -> int:
@@ -99,14 +109,26 @@ class _SwinUNETRDataset(Dataset):
 
     def __getitem__(self, idx: int):
         row = self.rows[idx]
+        image_path = row.get("image") or row.get("image_path")
+        mask_path = row.get("mask") or row.get("mask_path")
+        if image_path is None:
+            raise KeyError(f"Missing image path key in row. Expected 'image' or 'image_path'. Row keys: {list(row.keys())}")
+        if mask_path is None:
+            raise KeyError(f"Missing mask path key in row. Expected 'mask' or 'mask_path'. Row keys: {list(row.keys())}")
 
-        # ── Load grayscale PNG ──
-        img = cv2.imread(row["image"], cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise FileNotFoundError(f"Cannot load image: {row['image']}")
-        mask = cv2.imread(row["mask"], cv2.IMREAD_GRAYSCALE)
+        # ── Load image (auto-detect grayscale vs RGB from config) ──
+        if self.image_channels >= 3:
+            raw = cv2.imread(str(image_path), cv2.IMREAD_COLOR)  # BGR
+            if raw is None:
+                raise FileNotFoundError(f"Cannot load image: {image_path}")
+            img = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)  # [H,W,3]
+        else:
+            img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)  # [H,W]
+            if img is None:
+                raise FileNotFoundError(f"Cannot load image: {image_path}")
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         if mask is None:
-            raise FileNotFoundError(f"Cannot load mask: {row['mask']}")
+            raise FileNotFoundError(f"Cannot load mask: {mask_path}")
 
         # ── Label remap ──
         if self.label_map:
@@ -116,14 +138,21 @@ class _SwinUNETRDataset(Dataset):
             mask = new_mask
 
         # ── Resize ──
-        h, w = img.shape
         th, tw = self.image_size
-        if h != th or w != tw:
-            img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_LINEAR)
-            mask = cv2.resize(mask, (tw, th), interpolation=cv2.INTER_NEAREST)
-
-        # ── float [0,1], add channel dim → [1,H,W] ──
-        img = (img.astype(np.float32) / 255.0)[np.newaxis, ...]
+        if self.image_channels >= 3:
+            h, w, _ = img.shape
+            if h != th or w != tw:
+                img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_LINEAR)
+                mask = cv2.resize(mask, (tw, th), interpolation=cv2.INTER_NEAREST)
+            # float [0,1], channel-first → [3,H,W]
+            img = (img.astype(np.float32) / 255.0).transpose(2, 0, 1)
+        else:
+            h, w = img.shape
+            if h != th or w != tw:
+                img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_LINEAR)
+                mask = cv2.resize(mask, (tw, th), interpolation=cv2.INTER_NEAREST)
+            # float [0,1], add channel dim → [1,H,W]
+            img = (img.astype(np.float32) / 255.0)[np.newaxis, ...]
         mask = mask.astype(np.int64)[np.newaxis, ...]
 
         # ── MONAI spatial + intensity transforms ──
@@ -131,15 +160,17 @@ class _SwinUNETRDataset(Dataset):
             data = self.transforms({"image": img, "label": mask})
             img, mask = data["image"], data["label"]
 
-        # ── Grayscale → 3ch + ImageNet normalize (matches Seg-MoE inference) ──
+        # ── To 3ch + ImageNet normalize ──
         if isinstance(img, np.ndarray):
-            img = np.repeat(img, 3, axis=0)  # [3,H,W]
+            if img.shape[0] == 1:
+                img = np.repeat(img, 3, axis=0)  # grayscale → 3ch
             for c in range(3):
                 img[c] = (img[c] - _IMAGENET_MEAN[c]) / _IMAGENET_STD[c]
             img = torch.from_numpy(img)
             mask = torch.from_numpy(mask).squeeze(0).long()
         else:
-            img = img.repeat(3, 1, 1)
+            if img.shape[0] == 1:
+                img = img.repeat(3, 1, 1)
             for c in range(3):
                 img[c] = (img[c] - _IMAGENET_MEAN[c]) / _IMAGENET_STD[c]
             mask = mask.squeeze(0).long()
@@ -224,7 +255,7 @@ def main() -> None:
     dataset_cfg = load_config(args.dataset_config or exp_cfg["dataset"]["config"])
 
     seed = args.seed or exp_cfg.get("seed", 42)
-    seed_everything(seed)
+    seed_everything(seed, deterministic=False)  # deterministic=True triggers nll_loss2d warnings every forward pass
 
     # ── GPU setup ──
     if args.gpus:
@@ -242,7 +273,7 @@ def main() -> None:
 
     params = swin_cfg.get("params", {})
     num_classes: int = dataset_cfg["task"]["num_classes"]
-    in_channels = 3  # ImageNet-normalised grayscale → 3ch
+    in_channels = 3  # Always 3ch: RGB multi-modal or grayscale→replicate
 
     # ── Output directory ──
     if args.output_dir:
@@ -270,20 +301,18 @@ def main() -> None:
     print()
 
     # ── Build SwinUNETR ──
-    import inspect
-    valid_params = set(inspect.signature(SwinUNETR.__init__).parameters.keys())
-
+    # MONAI 1.3+ removed img_size from SwinUNETR (model is now input-size agnostic)
+    # patch_size here = Swin window-partition patch (default 2, i.e. 2×2 in 2D)
     swin_kwargs: Dict[str, Any] = {
         "in_channels": in_channels,
         "out_channels": num_classes,
         "spatial_dims": params.get("spatial_dims", 2),
         "feature_size": params.get("feature_size", 48),
+        "patch_size": params.get("patch_size", 2),
         "depths": params.get("depths", [2, 2, 2, 2]),
         "num_heads": params.get("num_heads", [3, 6, 12, 24]),
         "use_checkpoint": params.get("use_checkpoint", True),
     }
-    if "img_size" in valid_params and "img_size" in params:
-        swin_kwargs["img_size"] = tuple(params["img_size"])
 
     model = SwinUNETR(**swin_kwargs)
     n_params = sum(p.numel() for p in model.parameters())
@@ -312,13 +341,16 @@ def main() -> None:
     train_ds = _SwinUNETRDataset(train_rows, dataset_cfg, monai_transforms=_build_train_transforms())
     val_ds = _SwinUNETRDataset(val_rows, dataset_cfg, monai_transforms=None)
 
+    _use_persistent = args.num_workers > 0
     train_dl = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        persistent_workers=_use_persistent,
     )
     val_dl = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=_use_persistent,
     )
 
     # ── Official scheduler: WarmupCosine (step-level) ──
@@ -331,7 +363,8 @@ def main() -> None:
 
     # ── AMP ──
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float16
-    use_scaler = args.amp and amp_dtype == torch.float16
+    # GradScaler: always enabled with AMP — catches inf/NaN grads and auto-skips bad steps.
+    use_scaler = args.amp
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
     # ── TensorBoard ──
@@ -357,14 +390,13 @@ def main() -> None:
     print("Training ...")
     print("=" * 60)
 
-    global_step = start_epoch * steps_per_epoch
-
     for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_loss = 0.0
         step_count = 0
         t0 = time.time()
 
+        nan_steps = 0
         for batch_img, batch_mask, _ in train_dl:
             batch_img = batch_img.to(device)
             # DiceCELoss expects target [B, 1, H, W] (integer labels, will be one-hot'd)
@@ -372,20 +404,30 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
 
+            # Forward in half precision for speed
             with torch.amp.autocast("cuda", enabled=args.amp, dtype=amp_dtype):
                 logits = model(batch_img)
-                loss = loss_fn(logits, batch_mask)
 
-            if use_scaler:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                optimizer.step()
+            # Loss in float32 — DiceCELoss softmax+dice is numerically sensitive in bf16
+            loss = loss_fn(logits.float(), batch_mask)
+
+            # NaN guard
+            if not torch.isfinite(loss):
+                nan_steps += 1
+                if nan_steps >= 10:
+                    raise RuntimeError(
+                        f"Epoch {epoch+1}: {nan_steps} consecutive NaN — try reducing --lr or --batch-size."
+                    )
+                continue
+            nan_steps = 0
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
 
             scheduler.step()
-            global_step += 1
             epoch_loss += loss.item()
             step_count += 1
 

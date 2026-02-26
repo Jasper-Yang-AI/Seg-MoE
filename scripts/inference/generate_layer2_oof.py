@@ -85,8 +85,11 @@ def main() -> None:
                     help="Enable Test-Time Augmentation (horizontal + vertical flip)")
     ap.add_argument("--no-uncertainty", action="store_true",
                     help="Disable uncertainty channels (match Layer2 training)")
+    ap.add_argument("--no-save-logits", action="store_true",
+                    help="Skip saving raw logits (smaller files, but gating will use log-odds fallback)")
     ap.add_argument("--skip-existing", action="store_true")
     args = ap.parse_args()
+    args.save_logits = not args.no_save_logits  # logits saved by default
 
     exp_cfg = load_config(args.exp)
     dataset_cfg = load_config(exp_cfg["dataset"]["config"])
@@ -196,11 +199,12 @@ def main() -> None:
                 ids = [ids[0]] * B
 
             # ── Collect per-expert Layer2 predictions ──
-            batch_expert_probs = []  # List[np.ndarray], each [B, M, H, W]
+            batch_expert_probs = []   # List[np.ndarray], each [B, M, H, W]
+            batch_expert_logits = []  # List[np.ndarray], each [B, M, H, W]; populated only when --save-logits
             for model in expert_models:
                 with torch.no_grad():
-                    logits = model(x_batch.to(device))  # [B, M, H, W]
-                    probs = torch.softmax(logits, dim=1)
+                    raw_logits = model(x_batch.to(device))  # [B, M, H, W]
+                    probs = torch.softmax(raw_logits, dim=1)
 
                     if args.tta:
                         # Horizontal flip
@@ -213,7 +217,10 @@ def main() -> None:
                         probs_v = torch.softmax(torch.flip(logits_v, dims=[-2]), dim=1)
                         probs = (probs + probs_h + probs_v) / 3.0
 
-                    batch_expert_probs.append(probs.cpu().numpy())  # [B, M, H, W]
+                    batch_expert_probs.append(probs.cpu().numpy())   # [B, M, H, W]
+                    if args.save_logits:
+                        # Save raw logits (no TTA — deterministic, single-pass)
+                        batch_expert_logits.append(raw_logits.cpu().numpy())  # [B, M, H, W]
 
             # ── Save per-sample ──
             for b_idx in range(B):
@@ -227,6 +234,7 @@ def main() -> None:
                     "predictor_fold": int(fold),
                     "split": val_split,
                     "prob_path": rel_path.as_posix(),
+                    "has_logits": args.save_logits,
                     "num_classes": int(num_classes),
                     "num_experts": len(expert_cfgs),
                     "experts": list(ckpt_map.keys()),
@@ -247,7 +255,11 @@ def main() -> None:
                     continue
 
                 probs_k = [ep[b_idx].astype(cache_dtype) for ep in batch_expert_probs]
-                np.savez_compressed(out_path, probs=np.stack(probs_k, axis=0))  # [K,M,H,W]
+                save_kwargs: Dict[str, Any] = {"probs": np.stack(probs_k, axis=0)}  # [K,M,H,W]
+                if args.save_logits:
+                    logits_k = [el[b_idx].astype(np.float32) for el in batch_expert_logits]
+                    save_kwargs["logits"] = np.stack(logits_k, axis=0)  # [K,M,H,W] float32
+                np.savez_compressed(out_path, **save_kwargs)
                 all_records.append(rec)
 
     # ── Save manifest ──

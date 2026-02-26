@@ -1,10 +1,33 @@
 #!/usr/bin/env python
-"""测试GPU配置和双卡可用性"""
+"""测试GPU配置和双卡可用性.
 
+Note: 若 CUDA 驱动层崩溃 (cuInit access violation), 本文件中的测试
+      会被自动 skip, 不影响其他测试.
+"""
+import os
+import pytest
 import torch
 import torch.nn as nn
 
+# ── 安全检测 CUDA 是否可用 (防止 cuInit 崩溃) ──
+def _cuda_safe():
+    """Check CUDA via subprocess to avoid native crash (access violation)."""
+    if os.environ.get("CUDA_VISIBLE_DEVICES", None) == "":
+        return False
+    import subprocess, sys
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", "import torch; print(torch.cuda.is_available())"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return r.returncode == 0 and "True" in r.stdout
+    except Exception:
+        return False
 
+_HAS_CUDA = _cuda_safe()
+
+
+@pytest.mark.skipif(not _HAS_CUDA, reason="CUDA not available or driver crash")
 def test_gpu_availability():
     """测试GPU可用性和配置"""
     print("=" * 60)
@@ -40,15 +63,12 @@ def test_gpu_availability():
     return True
 
 
+@pytest.mark.skipif(not _HAS_CUDA, reason="CUDA not available or driver crash")
 def test_dataparallel():
     """测试DataParallel功能"""
     print("\n" + "=" * 60)
     print("DataParallel Test")
     print("=" * 60)
-    
-    if not torch.cuda.is_available():
-        print("❌ CUDA not available, skipping DataParallel test")
-        return False
     
     gpu_count = torch.cuda.device_count()
     
@@ -120,15 +140,12 @@ def test_dataparallel():
         return False
 
 
+@pytest.mark.skipif(not _HAS_CUDA, reason="CUDA not available or driver crash")
 def test_memory():
     """测试GPU显存"""
     print("\n" + "=" * 60)
     print("GPU Memory Test")
     print("=" * 60)
-    
-    if not torch.cuda.is_available():
-        print("❌ CUDA not available")
-        return False
     
     for i in range(torch.cuda.device_count()):
         torch.cuda.set_device(i)

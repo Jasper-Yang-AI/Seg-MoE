@@ -38,6 +38,7 @@ from seg_moe.gating.patch_gating_2d import (
     PatchConvGate2D,
     PatchGatingConfig,
     compute_load_balance_loss,
+    compute_spatial_smooth_loss,
     compute_temperature,
 )
 from seg_moe.models.factory_2d import list_experts
@@ -124,6 +125,7 @@ def main() -> None:
 
     patch_size = int(gcfg.get("patch_size", 64))
     stride = int(gcfg.get("stride", 32))
+    fg_oversample = float(gcfg.get("foreground_oversample_ratio", 0.0))
 
     # ---- OOF paths (Layer2 OOF, NOT Layer1) ----
     cache_root = Path(
@@ -165,7 +167,7 @@ def main() -> None:
     train_ds = GatingPatchDataset(
         train_rows, dataset_cfg, oof_manifest_path,
         expected_num_experts=K, patch_size=patch_size, stride=stride,
-        is_train=True,
+        is_train=True, foreground_oversample_ratio=fg_oversample,
     )
     val_ds = GatingPatchDataset(
         val_rows, dataset_cfg, oof_manifest_path,
@@ -173,7 +175,7 @@ def main() -> None:
         is_train=False,
     )
 
-    print(f"Gating | K={K} M={num_classes} patch={patch_size} stride={stride}")
+    print(f"Gating | K={K} M={num_classes} patch={patch_size} stride={stride} fg_oversample={fg_oversample}")
     print(f"Train patches: {len(train_ds)}, Val patches: {len(val_ds)}")
 
     bs = int(tcfg.get("batch_size", 512))
@@ -194,9 +196,11 @@ def main() -> None:
         hidden_dim=int(gcfg.get("hidden_dim", 64)),
         dropout=float(gcfg.get("dropout", 0.1)),
         per_class=bool(gcfg.get("per_class", False)),
+        use_residual_head=bool(gcfg.get("use_residual_head", True)),
         temperature_start=float(gcfg.get("temperature_start", 2.0)),
         temperature_end=float(gcfg.get("temperature_end", 0.5)),
         load_balance_weight=float(gcfg.get("load_balance_weight", 0.01)),
+        spatial_smooth_weight=float(gcfg.get("spatial_smooth_weight", 0.0)),
         blend_mode=str(gcfg.get("blend_mode", "gaussian")),
     )
     model = PatchConvGate2D(gate_cfg)
@@ -209,6 +213,7 @@ def main() -> None:
     loss_cfg = tcfg.get("loss", {})
     seg_loss_fn = build_loss_fn(loss_cfg, num_classes)
     lb_weight = gate_cfg.load_balance_weight
+    tv_weight = gate_cfg.spatial_smooth_weight
 
     # ---- Optimizer ----
     lr = float(tcfg.get("lr", 1e-3))
@@ -270,7 +275,7 @@ def main() -> None:
     t_end = gate_cfg.temperature_end
 
     print(f"Training gating: fold={fold} device={device} epochs={epochs} bs={bs} lr={lr}")
-    flog.info(f"Training gating: fold={fold} K={K} M={num_classes} patch={patch_size}")
+    flog.info(f"Training gating: fold={fold} K={K} M={num_classes} patch={patch_size} domain=logits")
 
     # ================================================================
     # Training loop
@@ -286,20 +291,22 @@ def main() -> None:
         n_steps = 0
 
         pbar = tqdm(train_loader, desc=f"gating e{epoch}/{epochs}")
-        for prob_flat, probs, mask in pbar:
-            prob_flat = prob_flat.to(device)             # [B, K*M, pH, pW]
-            probs = probs.to(device)                     # [B, K, M, pH, pW]
+        for logit_flat, logits_cache, mask in pbar:
+            logit_flat = logit_flat.to(device)           # [B, K*M, pH, pW]
+            logits_cache = logits_cache.to(device)       # [B, K, M, pH, pW]
             mask = mask.to(device)                       # [B, pH, pW]
 
             with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
-                weights = model(prob_flat, temperature=τ)  # [B, K] or [B, K, M]
-                fused = _unwrap(model).fuse_probs(probs, weights)  # [B, M, pH, pW]
+                weights = model(logit_flat, temperature=τ)  # [B, K] or [B, K, M]
+                fused = _unwrap(model).fuse_logits(logits_cache, weights)  # [B, M, pH, pW]
 
                 seg_loss = seg_loss_fn(fused, mask)
-                lb_loss = compute_load_balance_loss(
-                    weights if weights.dim() == 2 else weights.mean(dim=2)
-                )
-                loss = seg_loss + lb_weight * lb_loss
+
+                w_per_expert = _unwrap(model).weights_per_expert(weights)  # [B, K]
+                lb_loss = compute_load_balance_loss(w_per_expert)
+                tv_loss = compute_spatial_smooth_loss(w_per_expert) if tv_weight > 0 else w_per_expert.new_tensor(0.0)
+
+                loss = seg_loss + lb_weight * lb_loss + tv_weight * tv_loss
 
             if not torch.isfinite(loss):
                 opt.zero_grad(set_to_none=True)
@@ -331,14 +338,14 @@ def main() -> None:
         val_dices: list[float] = []
 
         with torch.no_grad():
-            for prob_flat, probs, mask in tqdm(val_loader, desc=f"val e{epoch}"):
-                prob_flat = prob_flat.to(device)
-                probs = probs.to(device)
+            for logit_flat, logits_cache, mask in tqdm(val_loader, desc=f"val e{epoch}"):
+                logit_flat = logit_flat.to(device)
+                logits_cache = logits_cache.to(device)
                 mask = mask.to(device)
 
                 with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
-                    weights = model(prob_flat, temperature=τ)
-                    fused = _unwrap(model).fuse_probs(probs, weights)
+                    weights = model(logit_flat, temperature=τ)
+                    fused = _unwrap(model).fuse_logits(logits_cache, weights)
                     loss = seg_loss_fn(fused, mask)
 
                 val_losses.append(float(loss.item()))
@@ -387,6 +394,7 @@ def main() -> None:
                 "hidden_dim": gate_cfg.hidden_dim,
                 "dropout": gate_cfg.dropout,
                 "per_class": gate_cfg.per_class,
+                "use_residual_head": gate_cfg.use_residual_head,
                 "blend_mode": gate_cfg.blend_mode,
             },
         }

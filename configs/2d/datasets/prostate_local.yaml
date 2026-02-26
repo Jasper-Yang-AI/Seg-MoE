@@ -1,0 +1,44 @@
+name: "prostate_local"
+
+task:
+  # 前列腺分割: 0=background, 1/2/3 = 前列腺区域 (如 PZ/TZ/lesion)
+  num_classes: 4
+  include_background_in_mean: false
+  ignore_index: null
+  label_map:
+    0: 0
+    1: 1
+    2: 2
+    3: 3
+
+paths:
+  raw_dir: "D:/Dataset002_ProstateCrop_Seg"
+  processed_dir: "data/processed/prostate_local"
+  splits_dir: "data/splits/prostate_local"
+
+raw_structure:
+  images_tr_dir: "imagesTr"
+  labels_tr_dir: "labelsTr"
+  images_ts_dir: "imagesTs"
+  labels_ts_dir: "labelsTs"
+
+input:
+  image_size: [256, 256]    # 必须是 2^7=128 的倍数 (nnUNet 8-stage)
+  image_channels: 3        # 3-modality MRI → RGB
+  n_modalities: 3
+  normalize:
+    mode: "imagenet"        # per-channel ImageNet normalization (pretrained weights)
+
+nifti:
+  slice_axis: 0             # SimpleITK GetArrayFromImage → [Z, Y, X]
+  slice_policy: "non_empty"
+  min_fg_pixels: 10
+  intensity:
+    mode: "percentile"      # per-modality percentile normalization
+    percentile_clip: [0.5, 99.5]
+
+split:
+  type: "train_5fold_test_fixed"
+  folds: 5
+  seed: 42
+  group_key: "patient_id"

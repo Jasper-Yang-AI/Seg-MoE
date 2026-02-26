@@ -63,6 +63,8 @@ data/processed/
 data/cache/
 # 保留 splits (small JSON/JSONL, 可复现的划分)
 !data/splits/
+# 该文件超过 GitHub 100MB 限制，保留本地不入库
+data/splits/prostate_local/splits_train5fold_testfixed.jsonl
 
 # nnUNet 官方流程生成的数据 (极大)
 nnunet_data/
