@@ -46,6 +46,62 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import yaml
 
+from seg_moe.models.factory_2d import expert_name, list_experts
+from seg_moe.utils.config import load_config, resolve_run_dir
+
+
+def _validate_unique_expert_names(experts: List[Dict[str, Any]]) -> None:
+    names = [expert_name(e) for e in experts]
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    if duplicates:
+        raise ValueError(
+            f"Duplicate expert names in models.yaml: {duplicates}. "
+            "Each expert name must be unique to avoid checkpoint path conflicts."
+        )
+
+
+def _resolve_nnunet_expert_name(models_cfg: Dict[str, Any], requested_name: Optional[str]) -> str:
+    experts = list_experts(models_cfg)
+    _validate_unique_expert_names(experts)
+    nnunet_experts = [e for e in experts if e.get("type", "").lower() == "nnunet"]
+
+    if requested_name:
+        for e in nnunet_experts:
+            if expert_name(e) == requested_name:
+                return requested_name
+        raise ValueError(
+            f"Requested nnUNet expert '{requested_name}' not found. "
+            f"Candidates: {[expert_name(e) for e in nnunet_experts]}"
+        )
+
+    if len(nnunet_experts) == 1:
+        return expert_name(nnunet_experts[0])
+    if len(nnunet_experts) == 0:
+        raise ValueError("No nnUNet expert found in models.yaml (experts_v2)")
+    raise ValueError(
+        "Multiple nnUNet experts found. Please specify --expert-name explicitly. "
+        f"Candidates: {[expert_name(e) for e in nnunet_experts]}"
+    )
+
+
+def _assert_no_checkpoint_conflict(output_dir: Path, source_path: str, overwrite: bool) -> None:
+    if overwrite:
+        return
+    best_path = output_dir / "best.pt"
+    if not best_path.exists():
+        return
+
+    existing = torch.load(best_path, map_location="cpu", weights_only=False)
+    existing_source = str(existing.get("nnunet_source", ""))
+    if existing_source and Path(existing_source).resolve() != Path(source_path).resolve():
+        raise RuntimeError(
+            "Checkpoint target conflict detected. Existing checkpoint source differs:\n"
+            f"  target: {best_path}\n"
+            f"  existing source: {existing_source}\n"
+            f"  new source     : {source_path}\n"
+            "Use --expert-name to choose another expert, or --overwrite to replace."
+        )
+
 
 def _find_dataset_dir(nnunet_results: Path, dataset_id: int) -> Optional[Path]:
     """Find the nnUNet results directory for a given dataset ID."""
@@ -360,7 +416,9 @@ def main() -> None:
     ap.add_argument("--folds", type=int, nargs="+", default=[0, 1, 2, 3, 4], help="Folds to import")
     ap.add_argument("--which", default="best", choices=["best", "final"], help="Which checkpoint to use")
     ap.add_argument("--exp", required=True, help="Seg-MoE experiment config YAML")
-    ap.add_argument("--expert-name", default="nnunet-2d", help="Expert name in Seg-MoE")
+    ap.add_argument("--models", default="configs/2d/models.yaml", help="Models config YAML (for expert name resolution)")
+    ap.add_argument("--expert-name", default=None, help="nnUNet expert name in models.yaml")
+    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing checkpoint if target exists")
     ap.add_argument("--update-models-yaml", default=None, help="Path to models.yaml to auto-update")
     ap.add_argument("--dry-run", action="store_true", help="Only display config, don't save")
     args = ap.parse_args()
@@ -369,11 +427,12 @@ def main() -> None:
     nnunet_results = base_dir / "nnUNet_results"
     nnunet_preprocessed = base_dir / "nnUNet_preprocessed"
 
-    # Load Seg-MoE experiment config
-    from seg_moe.utils.config import load_config, resolve_run_dir
+    # Load Seg-MoE experiment + models config
     exp_cfg = load_config(args.exp)
+    models_cfg = load_config(args.models)
     dataset_cfg = load_config(exp_cfg["dataset"]["config"])
     run_dir = Path(resolve_run_dir(exp_cfg))
+    resolved_expert_name = _resolve_nnunet_expert_name(models_cfg, args.expert_name)
 
     # Infer channels and classes from dataset config
     from seg_moe.data.indexing import infer_image_channels, infer_num_classes
@@ -428,11 +487,12 @@ def main() -> None:
         )
 
         # Save in Seg-MoE format
-        output_dir = run_dir / "checkpoints" / "layer1" / f"fold{fold}" / args.expert_name
+        output_dir = run_dir / "checkpoints" / "layer1" / f"fold{fold}" / resolved_expert_name
         if args.dry_run:
             print(f"  [dry-run] Would save to: {output_dir}")
             continue
 
+        _assert_no_checkpoint_conflict(output_dir, ckpt_info.get("source_path", ""), overwrite=args.overwrite)
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / "best.pt"
 
@@ -463,7 +523,7 @@ def main() -> None:
         success_count += 1
 
     # Print config snippet
-    output_dir_example = f"runs/{exp_cfg['exp_name']}/checkpoints/layer1/fold0/{args.expert_name}"
+    output_dir_example = f"runs/{exp_cfg['exp_name']}/checkpoints/layer1/fold0/{resolved_expert_name}"
     _print_yaml_snippet(arch_config, output_dir_example)
 
     # Auto-update models.yaml if requested

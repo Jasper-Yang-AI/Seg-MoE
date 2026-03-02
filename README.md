@@ -133,6 +133,8 @@ foreach ($fold in 0..4) {
 
 ### Step A4. 导入 nnUNet 权重到 Seg-MoE
 
+> 导入脚本默认会做目标冲突检查：若已有 `best.pt` 且来源不同会报错，避免覆盖；确需覆盖请加 `--overwrite`。
+
 ```powershell
 python scripts/nnunet/import_nnunet_weights.py `
   --nnunet-base nnunet_data `
@@ -140,6 +142,8 @@ python scripts/nnunet/import_nnunet_weights.py `
   --config 2d `
   --folds 0 1 2 3 4 `
   --exp configs/2d/exp/exp_prostate_local.yaml `
+  --models configs/2d/models.yaml `
+  --expert-name nnunet-2d `
   --update-models-yaml configs/2d/models.yaml
 ```
 
@@ -184,16 +188,22 @@ foreach ($fold in 0..4) {
 中断恢复：
 
 ```powershell
-python scripts/monai/train_swinunetr_official.py `
-  --exp    configs/2d/exp/exp_prostate_local.yaml `
-  --models configs/2d/models.yaml `
-  --fold 0 --gpus 0,1 `
-  --epochs 300 --batch-size 16 `
-  --amp --amp-dtype bfloat16 `
-  --resume runs/swinunetr_official_prostate_local/fold0/latest_model.pt
+# SwinUNETR 5-fold 续训
+foreach ($fold in 0..4) {
+  python scripts/monai/train_swinunetr_official.py `
+    --exp    configs/2d/exp/exp_prostate_local.yaml `
+    --models configs/2d/models.yaml `
+    --fold $fold --gpus 0,1 `
+    --epochs 300 --batch-size 16 `
+    --amp --amp-dtype bfloat16 `
+    --num-workers 2 `
+    --resume "runs/swinunetr_official_prostate_local/fold$fold/latest_model.pt"
+}
 ```
 
 ### Step B2. 导入权重到 Seg-MoE
+
+> 建议始终显式指定 `--expert-name`，避免同类型多专家时写入冲突。
 
 ```powershell
 foreach ($fold in 0..4) {
@@ -201,7 +211,8 @@ foreach ($fold in 0..4) {
     --source runs/swinunetr_official_prostate_local/fold$fold/best_model.pt `
     --exp    configs/2d/exp/exp_prostate_local.yaml `
     --models configs/2d/models.yaml `
-    --fold $fold
+    --fold $fold `
+    --expert-name swinunetr-2d
 }
 ```
 
@@ -248,16 +259,23 @@ foreach ($fold in 0..4) {
 中断恢复：
 
 ```powershell
-python scripts/monai/train_segresnet_official.py `
-  --exp    configs/2d/exp/exp_prostate_local.yaml `
-  --models configs/2d/models.yaml `
-  --fold 0 --gpus 0,1 `
-  --epochs 300 --batch-size 32 `
-  --dsdepth 2 --amp --amp-dtype bfloat16 `
-  --resume runs/segresnet_official_prostate_local/fold0/latest_model.pt
+# SegResNet 5-fold 续训
+foreach ($fold in 0..4) {
+  python scripts/monai/train_segresnet_official.py `
+    --exp    configs/2d/exp/exp_prostate_local.yaml `
+    --models configs/2d/models.yaml `
+    --fold $fold --gpus 1 `
+    --epochs 300 --batch-size 32 `
+    --dsdepth 2 `
+    --amp --amp-dtype bfloat16 `
+    --num-workers 2 `
+    --resume "runs/segresnet_official_prostate_local/fold$fold/latest_model.pt"
+}
 ```
 
 ### Step C2. 导入权重到 Seg-MoE
+
+> 若需要强制覆盖已导入权重，可在命令末尾追加 `--overwrite`。
 
 ```powershell
 foreach ($fold in 0..4) {
@@ -265,7 +283,8 @@ foreach ($fold in 0..4) {
     --source runs/segresnet_official_prostate_local/fold$fold/best_model.pt `
     --exp    configs/2d/exp/exp_prostate_local.yaml `
     --models configs/2d/models.yaml `
-    --fold $fold
+    --fold $fold `
+    --expert-name segresnet-2d
 }
 ```
 

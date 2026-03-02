@@ -29,12 +29,71 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any, Dict, List
 
 import torch
 
 from seg_moe.data.indexing import infer_num_classes
 from seg_moe.models.factory_2d import build_expert, expert_name, list_experts
 from seg_moe.utils.config import load_config, resolve_run_dir
+
+
+def _validate_unique_expert_names(experts: List[Dict[str, Any]]) -> None:
+    names = [expert_name(e) for e in experts]
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    if duplicates:
+        raise ValueError(
+            f"Duplicate expert names in models.yaml: {duplicates}. "
+            "Each expert name must be unique to avoid checkpoint path conflicts."
+        )
+
+
+def _resolve_swin_expert(
+    experts: List[Dict[str, Any]],
+    requested_name: str | None,
+) -> tuple[Dict[str, Any], str]:
+    swin_types = {"monai_swin_unetr", "swinunetr"}
+    candidates = [e for e in experts if e.get("type", "").lower() in swin_types]
+
+    if requested_name:
+        for e in candidates:
+            if expert_name(e) == requested_name:
+                return e, requested_name
+        raise ValueError(
+            f"Requested expert '{requested_name}' not found among SwinUNETR experts: "
+            f"{[expert_name(e) for e in candidates]}"
+        )
+
+    if len(candidates) == 1:
+        e = candidates[0]
+        return e, expert_name(e)
+
+    if len(candidates) == 0:
+        raise ValueError("No SwinUNETR expert found in models.yaml (experts_v2)")
+
+    raise ValueError(
+        "Multiple SwinUNETR experts found. Please specify --expert-name explicitly. "
+        f"Candidates: {[expert_name(e) for e in candidates]}"
+    )
+
+
+def _assert_no_checkpoint_conflict(out_dir: Path, source: Path, overwrite: bool) -> None:
+    if overwrite:
+        return
+    best_path = out_dir / "best.pt"
+    if not best_path.exists():
+        return
+
+    existing = torch.load(best_path, map_location="cpu", weights_only=False)
+    existing_source = str(existing.get("source_path", ""))
+    if existing_source and Path(existing_source).resolve() != source.resolve():
+        raise RuntimeError(
+            "Checkpoint target conflict detected. Existing checkpoint source differs:\n"
+            f"  target: {best_path}\n"
+            f"  existing source: {existing_source}\n"
+            f"  new source     : {source}\n"
+            "Use --expert-name to choose another expert, or --overwrite to replace."
+        )
 
 
 def main() -> None:
@@ -47,6 +106,8 @@ def main() -> None:
     ap.add_argument("--fold", type=int, required=True, help="Fold index (0-4)")
     ap.add_argument("--layer", default="layer1", choices=["layer1", "layer2"])
     ap.add_argument("--dataset-config", default=None)
+    ap.add_argument("--expert-name", default=None, help="Expert name in models.yaml (recommended)")
+    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing checkpoint if target exists")
     args = ap.parse_args()
 
     source = Path(args.source)
@@ -60,15 +121,9 @@ def main() -> None:
     run_dir = resolve_run_dir(exp_cfg)
 
     # ── Find SwinUNETR expert config ──
-    swin_cfg = None
-    swin_name = None
-    for ec in list_experts(models_cfg):
-        if ec.get("type", "").lower() in ("monai_swin_unetr", "swinunetr"):
-            swin_cfg = ec
-            swin_name = expert_name(ec)
-            break
-    if swin_cfg is None:
-        raise ValueError("No SwinUNETR expert found in models.yaml (experts_v2)")
+    experts = list_experts(models_cfg)
+    _validate_unique_expert_names(experts)
+    swin_cfg, swin_name = _resolve_swin_expert(experts, args.expert_name)
 
     num_classes = infer_num_classes(dataset_cfg)
     in_channels = 3  # ImageNet-normalised
@@ -117,6 +172,7 @@ def main() -> None:
 
     # ── Save in Seg-MoE format ──
     out_dir = Path(run_dir) / "checkpoints" / args.layer / f"fold{args.fold}" / swin_name
+    _assert_no_checkpoint_conflict(out_dir, source, overwrite=args.overwrite)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     seg_moe_ckpt = {
