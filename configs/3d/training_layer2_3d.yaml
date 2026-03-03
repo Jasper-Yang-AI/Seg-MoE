@@ -1,0 +1,92 @@
+# 3D Layer2 专家训练配置 (RTX 5090 32GB 单卡优化)
+# Layer2 输入 = concat([volume, L1_OOF_probs, uncertainty])
+# 更低 LR + 更短 schedule: 迁移 Layer1 权重后 fine-tune
+#
+# 硬件优化要点 (RTX 5090 / Blackwell):
+#   - BF16 混合精度 (原生 Tensor Core 支持, 比 FP16 更稳定, 无需 GradScaler)
+#   - bs=2 + grad_accum=2 → 等效 bs=4 (3D 128³ patch, SwinUNETR 约 22GB)
+#   - num_workers=2 (Windows 下稳定), prefetch_factor=3 (提升 IO 吞吐)
+#   - persistent_workers=true (减少 worker 启动开销)
+#   - Boundary Loss 提升边缘精度 (Kervadec et al. MIDL 2019)
+
+lr: 5.0e-5
+epochs: 150
+batch_size: 2
+gradient_accumulation_steps: 2      # effective BS = 4
+
+optimizer:
+  name: "adamw"
+  weight_decay: 0.01                # 较强正则, 防止小数据过拟合
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  name: "cosine"
+  warmup_epochs: 10
+  min_lr: 1.0e-7
+
+amp:
+  enabled: true
+  dtype: "bfloat16"
+
+loss:
+  name: "ce_dice_boundary"          # Layer2 推荐: CE + Dice + Boundary
+  ce_weight: 1.0
+  dice_weight: 1.0
+  dice_smooth: 1.0
+  boundary_weight: 0.5              # Boundary Loss 权重
+
+checkpoint:
+  monitor: "val_dice_mean"
+  save_best: true
+  save_last: true
+
+logging:
+  log_interval: 10
+  val_interval: 1
+
+dataloader:
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 3
+
+sliding_window:
+  roi_size: [128, 128, 64]
+  sw_batch_size: 2
+  overlap: 0.5
+  mode: "gaussian"
+
+# ── B4: Per-expert LR overrides (参考2D官方训练 recipe 做差分化配置) ──
+# key = expert name (对应 models_3d.yaml 中的 name 字段)
+expert_overrides:
+  nnunet-3d:
+    optimizer:
+      name: "sgd"
+      momentum: 0.99
+      nesterov: true
+      weight_decay: 3.0e-5
+    lr: 1.0e-4
+    scheduler:
+      name: "poly"
+      poly_power: 0.9
+
+  swinunetr-3d:
+    optimizer:
+      name: "adamw"
+      weight_decay: 1.0e-5
+    lr: 1.0e-5                      # Transformer 用更小 LR 避免覆盖预训练特征
+    scheduler:
+      name: "cosine"
+      min_lr: 1.0e-7
+      warmup_epochs: 10
+
+  segresnet-3d:
+    optimizer:
+      name: "adamw"
+      weight_decay: 1.0e-5
+    lr: 2.0e-5
+    scheduler:
+      name: "cosine"
+      min_lr: 1.0e-7
+      warmup_epochs: 5

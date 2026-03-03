@@ -103,6 +103,19 @@ def _parse_spacing(meta: dict) -> Optional[tuple[float, float]]:
     return None
 
 
+def _load_probs_from_cache(cache_path: Path) -> np.ndarray:
+    """Load [K,M,H,W] probabilities from logits-first cache."""
+    data = np.load(cache_path)
+    if "logits" in data:
+        logits = data["logits"].astype(np.float32)
+        logits = logits - logits.max(axis=1, keepdims=True)
+        exp_logits = np.exp(logits)
+        return exp_logits / (exp_logits.sum(axis=1, keepdims=True) + 1e-8)
+    if "probs" in data:
+        return data["probs"].astype(np.float32)
+    raise KeyError(f"Cache file missing 'logits'/'probs': {cache_path}")
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Phase A/B: Single expert evaluation
 # ═══════════════════════════════════════════════════════════════════════
@@ -156,7 +169,7 @@ def _collect_oof_flat(
         prob_path = get_oof_prob_path(oof_map, sid)
         if not prob_path.exists():
             continue
-        probs = np.load(prob_path)["probs"].astype(np.float32)  # [K,M,H,W]
+        probs = _load_probs_from_cache(prob_path)  # [K,M,H,W]
         K, M, H, W = probs.shape
         # Load mask
         mask = np.array(Image.open(s["mask_path"]).convert("L"), dtype=np.uint8)
@@ -196,7 +209,7 @@ def _eval_combiner_per_sample(
         prob_path = get_oof_prob_path(oof_map, sid)
         if not prob_path.exists():
             continue
-        probs = np.load(prob_path)["probs"].astype(np.float32)  # [K,M,H,W]
+        probs = _load_probs_from_cache(prob_path)  # [K,M,H,W]
         K, M, H, W = probs.shape
 
         # Load mask
@@ -248,7 +261,7 @@ def _eval_mean_ensemble_from_oof(
         prob_path = get_oof_prob_path(oof_map, sid)
         if not prob_path.exists():
             continue
-        probs = np.load(prob_path)["probs"].astype(np.float32)  # [K,M,H,W]
+        probs = _load_probs_from_cache(prob_path)  # [K,M,H,W]
         fused = probs.mean(axis=0)  # [M,H,W]
 
         mask = np.array(Image.open(s["mask_path"]).convert("L"), dtype=np.uint8)

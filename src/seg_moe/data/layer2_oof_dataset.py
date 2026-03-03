@@ -22,8 +22,9 @@ class Layer2OOFDataset(Dataset):
     - Spatial transforms are applied to (image, mask, probs) together.
     - Image-only transforms are applied to image only.
 
-    The OOF probabilities are expected to be stored as npz with key 'probs':
-      probs shape [K, M, H, W] (experts x classes x height x width)
+        The OOF cache is expected to store logits with key 'logits':
+            logits shape [K, M, H, W] (experts x classes x height x width)
+        (legacy cache with key 'probs' is still supported)
 
     The model input becomes (with uncertainty channels enabled):
       x = concat([image[C,H,W], probs_flat[K*M,H,W],
@@ -96,7 +97,15 @@ class Layer2OOFDataset(Dataset):
                 "Run scripts/inference/generate_layer1_oof.py first."
             )
         npz = np.load(prob_path)
-        probs = npz["probs"].astype(np.float32)  # [K,M,H,W]
+        if "logits" in npz:
+            logits = npz["logits"].astype(np.float32)  # [K,M,H,W]
+            logits = logits - logits.max(axis=1, keepdims=True)
+            exp_logits = np.exp(logits)
+            probs = exp_logits / (exp_logits.sum(axis=1, keepdims=True) + 1e-8)
+        elif "probs" in npz:
+            probs = npz["probs"].astype(np.float32)  # legacy [K,M,H,W]
+        else:
+            raise KeyError(f"OOF cache missing 'logits'/'probs' for sample_id={sample_id}: {prob_path}")
         if probs.ndim != 4:
             raise ValueError(f"Unexpected probs shape for {sample_id}: {probs.shape} (expected [K,M,H,W])")
         return probs

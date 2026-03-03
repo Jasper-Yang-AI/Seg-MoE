@@ -1,0 +1,42 @@
+name: "liver_3d"
+
+task:
+  # Dataset003_v2_LiverTumorSeg: 0=background, 1=liver_tumor
+  num_classes: 2
+  include_background_in_mean: false
+  ignore_index: null
+  label_map:
+    0: 0
+    1: 1
+
+paths:
+  # 每个 case ID 形如 {patientID}_{modality}，例如 1075128_ADC
+  # imagesTr/{caseID}_0000.nii.gz  +  labelsTr/{caseID}.nii.gz
+  raw_dir:    "D:/Dataset003_v2_LiverTumorSeg"
+  splits_dir: "data/splits/liver_3d"
+
+raw_structure:
+  images_tr_dir: "imagesTr"
+  labels_tr_dir: "labelsTr"
+  images_ts_dir: "imagesTs"
+  labels_ts_dir: "labelsTs"
+  # 单通道，每个 case 只有 _0000 一个模态文件
+  modality_suffixes: ["_0000.nii.gz"]
+
+input:
+  image_channels: 1          # 单通道 MRI
+  spatial_size: [128, 128, 64]   # 训练 crop size [H, W, D]
+  roi_size:     [128, 128, 64]   # sliding-window 推理 ROI
+
+intensity:
+  mode: "percentile"          # per-volume percentile clip + z-score
+  percentile_clip: [0.5, 99.5]
+
+split:
+  type: "train_5fold_test_fixed"
+  folds: 5
+  seed: 42
+  group_key: "patient_id"
+  # case ID 形如 "1075128_ADC"，用正则提取数字前缀作为真实病人 ID
+  # 确保同一病人的全部序列归入同一 fold，避免数据泄露
+  patient_group_regex: '^(\d+)_'

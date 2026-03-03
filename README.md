@@ -1,115 +1,31 @@
-# Seg-MoE（本地前列腺数据完整训练手册）
+# Seg-MoE 训练手册
 
-本项目实现 Two-Layer Ensemble（Layer1 → Layer1 OOF → Layer2 → Layer2 OOF → Gating），
-支持三专家融合：nnUNet、SwinUNETR、SegResNet。
-
-本 README 按你当前本地数据场景编写：
-- 本地数据目录：`D:\Dataset002_ProstateCrop_Seg`
-- 任务：2D 训练流程（但 nnUNet 官方输入仍是 3D NIfTI，属于正常设计）
-- 实验配置：`configs/2d/exp/exp_prostate_local.yaml`
+Two-Layer Ensemble 管线：**Layer1（三专家官方训练）→ Layer1 OOF → Layer2 → Layer2 OOF → Gating → 评估**  
+三专家：nnUNet · SwinUNETR · SegResNet
 
 ---
 
-## 1. 先决条件
-
-### 1.1 Python 环境
+## 0. 安装
 
 ```powershell
 conda create -n segmoe python=3.10 -y
 conda activate segmoe
 pip install -r requirements.txt
 pip install -e .
-```
-
-### 1.2 nnUNet 依赖
-
-```powershell
 pip install "nnunetv2>=2.2"
 ```
 
-### 1.3 GPU 检查（可选但推荐）
-
-```powershell
-nvidia-smi
-```
-
-如果 `torch.cuda.is_available()` 在你机器上崩溃，先修复驱动后再开始训练。
-
 ---
 
-## 2. 数据与配置对应关系
+## 1. 数据集与配置对照表
 
-你的本地数据应为 nnUNet 风格目录：
+| 数据集 | 维度 | 类别 | 通道 | 数据集配置 | 实验配置 | 模型配置 |
+|--------|------|------|------|-----------|---------|---------|
+| Prostate（本地） | 2D PNG | 4 (bg/PZ/TZ/lesion) | 3 | `configs/2d/datasets/prostate_local.yaml` | `configs/2d/exp/exp_prostate_local.yaml` | `configs/2d/models.yaml` |
+| Prostate（本地） | 3D NIfTI | 4 | 3 | `configs/3d/datasets/prostate_local_3d.yaml` | `configs/3d/exp/exp_prostate_local_3d.yaml` | `configs/3d/models_3d.yaml` |
+| Liver（Dataset003） | 3D NIfTI | 2 (bg/tumor) | 1 | `configs/3d/datasets/liver_3d.yaml` | `configs/3d/exp/exp_liver_3d.yaml` | `configs/3d/models_3d_liver.yaml` |
 
-```text
-D:\Dataset002_ProstateCrop_Seg/
-  imagesTr/
-    xxx_0000.nii.gz
-    xxx_0001.nii.gz
-    xxx_0002.nii.gz
-  labelsTr/
-    xxx.nii.gz
-  imagesTs/
-  labelsTs/
-```
-
-项目中对应配置：
-- 数据集配置：`configs/2d/datasets/prostate_local.yaml`
-- 实验配置：`configs/2d/exp/exp_prostate_local.yaml`
-- 模型配置：`configs/2d/models.yaml`
-- Layer2 训练配置：`configs/2d/training_layer2.yaml`
-- 门控配置：`configs/2d/gating.yaml`
-
----
-
-## 3. 一次性数据准备（本地前列腺）
-
-### 3.1 生成 2D PNG（供 SwinUNETR / SegResNet / Seg-MoE 2D 管线）
-
-```powershell
-python scripts/data/prepare_prostate.py --config configs/2d/datasets/prostate_local.yaml
-```
-
-输出：
-- `data/processed/prostate_local/images/*.png`
-- `data/processed/prostate_local/masks/*.png`
-- `data/splits/prostate_local/index_all.jsonl`
-
-### 3.2 生成 5-fold 切分（固定 raw_test）
-
-```powershell
-python scripts/data/make_splits.py --dataset-config configs/2d/datasets/prostate_local.yaml
-```
-
-输出：
-- `data/splits/prostate_local/splits_train5fold_testfixed.jsonl`
-
----
-
-## 4. Layer1：三专家官方训练
-
-> 三专家均可独立训练，互不依赖。推荐并行跑 nnUNet（多终端）+ SwinUNETR/SegResNet（主终端）。
-
----
-
-## 4.1 Expert A：nnUNet v2（官方 CLI）
-
-> nnUNet 仍使用 3D NIfTI 输入，配置选 `2d` 即为 2D 切片训练，这是官方标准设计。
-
-### Step A1. 建立 nnUNet task（仅需一次）
-
-```powershell
-python scripts/nnunet/setup_nnunet_task.py `
-  --data-dir D:/Dataset002_ProstateCrop_Seg `
-  --dataset-id 2 `
-  --dataset-name ProstateCrop_Seg `
-  --channel-names T2w ADC DWI `
-  --labels background PZ TZ lesion `
-  --exp configs/2d/exp/exp_prostate_local.yaml `
-  --verify
-```
-
-### Step A2. 设置 nnUNet 环境变量（每个新终端都要执行）
+**nnUNet 环境变量**（每个新终端执行一次）：
 
 ```powershell
 $env:nnUNet_raw          = "D:\Seg-MoE\nnunet_data\nnUNet_raw"
@@ -117,380 +33,246 @@ $env:nnUNet_preprocessed = "D:\Seg-MoE\nnunet_data\nnUNet_preprocessed"
 $env:nnUNet_results      = "D:\Seg-MoE\nnunet_data\nnUNet_results"
 ```
 
-### Step A3. 官方训练（2D，5 折）
+---
+
+## 2. 2D 前列腺实验
+
+**执行顺序**：数据准备 → nnUNet+SwinUNETR+SegResNet 并行训练 → 导入权重 → Layer1 OOF → Layer2 → Layer2 OOF → Gating → 评估
+
+**入口说明（重要）**：
+- **Layer1 正式训练** 使用官方入口：`nnUNetv2_train`、`scripts/monai/train_swinunetr_official.py`、`scripts/monai/train_segresnet_official.py`。
+- **Layer2 训练** 使用工程统一入口：`scripts/train/train_layer2.py` + `configs/2d/training_layer2.yaml`。
+
+### Step 1：数据准备（仅需一次）
 
 ```powershell
-# 首次训练
-foreach ($fold in 0..4) {
-  nnUNetv2_train 2 2d $fold --npz
-}
-
-# 中断后恢复
-foreach ($fold in 0..4) {
-  nnUNetv2_train 2 2d $fold --npz --c
-}
+python scripts/data/prepare_prostate.py --config configs/2d/datasets/prostate_local.yaml
+python scripts/data/make_splits.py --dataset-config configs/2d/datasets/prostate_local.yaml
 ```
 
-### Step A4. 导入 nnUNet 权重到 Seg-MoE
-
-> 导入脚本默认会做目标冲突检查：若已有 `best.pt` 且来源不同会报错，避免覆盖；确需覆盖请加 `--overwrite`。
+### Step 2：nnUNet 2D（5 折）
 
 ```powershell
+python scripts/nnunet/setup_nnunet_task.py `
+  --data-dir E:/nnunetv2_WebUI/nnUNet_raw/Dataset002_ProstateCrop_seg `
+  --dataset-id 2 --dataset-name ProstateCrop_Seg `
+  --channel-names T2w ADC DWI --labels background PZ TZ lesion `
+  --exp configs/2d/exp/exp_prostate_local.yaml --verify
+
+foreach ($fold in 0..4) { nnUNetv2_train 2 2d $fold --npz }   # 续训加 --c
+
 python scripts/nnunet/import_nnunet_weights.py `
-  --nnunet-base nnunet_data `
-  --dataset-id 2 `
-  --config 2d `
-  --folds 0 1 2 3 4 `
-  --exp configs/2d/exp/exp_prostate_local.yaml `
-  --models configs/2d/models.yaml `
-  --expert-name nnunet-2d `
+  --nnunet-base nnunet_data --dataset-id 2 --config 2d `
+  --folds 0 1 2 3 4 --exp configs/2d/exp/exp_prostate_local.yaml `
+  --models configs/2d/models.yaml --expert-name nnunet-2d `
   --update-models-yaml configs/2d/models.yaml
 ```
 
----
-
-## 4.2 Expert B：SwinUNETR（MONAI 1.5 官方 recipe）
-
-**已验证参数**（MONAI 1.5.2，`img_size` 已移除，用 `patch_size=2` 代替）：
-- `feature_size=48`（base 规格，25M 参数）
-- `spatial_dims=2`，`depths=(2,2,2,2)`，`num_heads=(3,6,12,24)`
-- 优化器 AdamW `lr=1e-4`，WarmupCosine warmup=50 epoch（step-level）
-- 损失 DiceCELoss（`to_onehot_y=True, softmax=True`）
-
-### Step B1. 训练
-
-单折（快速验证）：
-
-```powershell
-python scripts/monai/train_swinunetr_official.py `
-  --exp    configs/2d/exp/exp_prostate_local.yaml `
-  --models configs/2d/models.yaml `
-  --fold 0 --gpus 0,1 `
-  --epochs 300 --batch-size 16 `
-  --amp --amp-dtype bfloat16 `
-  --num-workers 2
-```
-
-全 5 折：
+### Step 3：SwinUNETR 2D（5 折）
 
 ```powershell
 foreach ($fold in 0..4) {
   python scripts/monai/train_swinunetr_official.py `
-    --exp    configs/2d/exp/exp_prostate_local.yaml `
-    --models configs/2d/models.yaml `
-    --fold $fold --gpus 0,1 `
-    --epochs 300 --batch-size 16 `
-    --amp --amp-dtype bfloat16 `
-    --num-workers 2
+    --exp configs/2d/exp/exp_prostate_local.yaml --models configs/2d/models.yaml `
+    --fold $fold --gpus 0,1 --epochs 300 --batch-size 16 `
+    --amp --amp-dtype bfloat16 --num-workers 2
+    # 续训加: --resume "runs/swinunetr_official_prostate_local/fold$fold/latest_model.pt"
 }
-```
-
-中断恢复：
-
-```powershell
-# SwinUNETR 5-fold 续训
-foreach ($fold in 0..4) {
-  python scripts/monai/train_swinunetr_official.py `
-    --exp    configs/2d/exp/exp_prostate_local.yaml `
-    --models configs/2d/models.yaml `
-    --fold $fold --gpus 0,1 `
-    --epochs 300 --batch-size 16 `
-    --amp --amp-dtype bfloat16 `
-    --num-workers 2 `
-    --resume "runs/swinunetr_official_prostate_local/fold$fold/latest_model.pt"
-}
-```
-
-### Step B2. 导入权重到 Seg-MoE
-
-> 建议始终显式指定 `--expert-name`，避免同类型多专家时写入冲突。
-
-```powershell
 foreach ($fold in 0..4) {
   python scripts/monai/import_swinunetr_weights.py `
     --source runs/swinunetr_official_prostate_local/fold$fold/best_model.pt `
-    --exp    configs/2d/exp/exp_prostate_local.yaml `
-    --models configs/2d/models.yaml `
-    --fold $fold `
-    --expert-name swinunetr-2d
+    --exp configs/2d/exp/exp_prostate_local.yaml --models configs/2d/models.yaml `
+    --fold $fold --expert-name swinunetr-2d
 }
 ```
 
----
-
-## 4.3 Expert C：SegResNet（MONAI Auto3DSeg 官方 recipe）
-
-**已验证参数**（MONAI 1.5.2，29M 参数）：
-- `SegResNetDS(dsdepth=2)` 训练（深度监督）→ `dsdepth=1` 推理
-- `init_filters=32`，`blocks_down=(1,2,2,4,4)`（5 阶），`norm=BATCH`
-- 优化器 AdamW `lr=2e-4`，WarmupCosine warmup=3 epoch（epoch-level）
-- 损失 `DiceCELoss(squared_pred=True, batch=True)`（Auto3DSeg 官方设定）
-
-### Step C1. 训练
-
-单折（快速验证）：
-
-```powershell
-python scripts/monai/train_segresnet_official.py `
-  --exp    configs/2d/exp/exp_prostate_local.yaml `
-  --models configs/2d/models.yaml `
-  --fold 0 --gpus 0,1 `
-  --epochs 300 --batch-size 32 `
-  --dsdepth 2 `
-  --amp --amp-dtype bfloat16 `
-  --num-workers 2
-```
-
-全 5 折：
+### Step 4：SegResNet 2D（5 折）
 
 ```powershell
 foreach ($fold in 0..4) {
   python scripts/monai/train_segresnet_official.py `
-    --exp    configs/2d/exp/exp_prostate_local.yaml `
-    --models configs/2d/models.yaml `
-    --fold $fold --gpus 1 `
-    --epochs 300 --batch-size 32 `
-    --dsdepth 2 `
-    --amp --amp-dtype bfloat16 `
-    --num-workers 2
+    --exp configs/2d/exp/exp_prostate_local.yaml --models configs/2d/models.yaml `
+    --fold $fold --gpus 0,1 --epochs 300 --batch-size 32 --dsdepth 2 `
+    --amp --amp-dtype bfloat16 --num-workers 2
+    # 续训加: --resume "runs/segresnet_official_prostate_local/fold$fold/latest_model.pt"
 }
-```
-
-中断恢复：
-
-```powershell
-# SegResNet 5-fold 续训
-foreach ($fold in 0..4) {
-  python scripts/monai/train_segresnet_official.py `
-    --exp    configs/2d/exp/exp_prostate_local.yaml `
-    --models configs/2d/models.yaml `
-    --fold $fold --gpus 1 `
-    --epochs 300 --batch-size 32 `
-    --dsdepth 2 `
-    --amp --amp-dtype bfloat16 `
-    --num-workers 2 `
-    --resume "runs/segresnet_official_prostate_local/fold$fold/latest_model.pt"
-}
-```
-
-### Step C2. 导入权重到 Seg-MoE
-
-> 若需要强制覆盖已导入权重，可在命令末尾追加 `--overwrite`。
-
-```powershell
 foreach ($fold in 0..4) {
   python scripts/monai/import_segresnet_weights.py `
     --source runs/segresnet_official_prostate_local/fold$fold/best_model.pt `
-    --exp    configs/2d/exp/exp_prostate_local.yaml `
-    --models configs/2d/models.yaml `
-    --fold $fold `
-    --expert-name segresnet-2d
+    --exp configs/2d/exp/exp_prostate_local.yaml --models configs/2d/models.yaml `
+    --fold $fold --expert-name segresnet-2d
 }
 ```
 
----
+### Step 5：Layer1 OOF → Layer2 → Layer2 OOF → Gating → 评估
 
-## 4.4 TensorBoard 监控（三专家共用）
-
-```powershell
-# 新终端启动（保持后台运行）
-tensorboard --logdir runs/ --port 6006
-# 浏览器打开 http://localhost:6006
-```
-
-验收指标：
-| 专家 | Epoch 1 loss 参考 | 收敛后 val Dice |
-|------|-------------------|----------------|
-| nnUNet | 0.5–1.0（DS loss） | > 0.70 |
-| SwinUNETR | 1.0–2.0 | > 0.65 |
-| SegResNet | 0.8–1.5（DS loss） | > 0.65 |
-
----
-
-## 4.5 显存与 batch size 参考（双 RTX 5090，bfloat16）
-
-| 专家 | 参数量 | 推荐 batch-size | 单卡显存 |
-|------|-------|----------------|---------|
-| nnUNet | ~46M | 由 nnUNet 自动规划 | ~12 GB |
-| SwinUNETR | 25M | 16（DataParallel） | ~14 GB |
-| SegResNet | 29M | 32（DataParallel） | ~8 GB |
-
-OOM 时依次尝试：`--batch-size 16 → 8 → 4`；或加 `--num-workers 0`。
-
----
-
-## 5. 生成 Layer1 OOF（训练 Layer2 的前提）
+> 说明：Step 5 开始，Layer1 使用的是 Step 2/3/4 导入后的官方专家权重；Layer2 由统一训练器 `train_layer2.py` 按工程配置训练。
 
 ```powershell
 python scripts/inference/generate_layer1_oof.py `
-  --exp configs/2d/exp/exp_prostate_local.yaml `
-  --models configs/2d/models.yaml `
-  --which best `
-  --batch-size 32 `
-  --tta
-```
+  --exp configs/2d/exp/exp_prostate_local.yaml --models configs/2d/models.yaml `
+  --which best --batch-size 32 --tta
 
-输出（默认）：
-- `runs/segmoe_2d_prostate/cache/oof/layer1/fold_*/{sample_id}.npz`
-- `runs/segmoe_2d_prostate/cache/oof/layer1/oof_manifest.jsonl`
-
----
-
-## 6. 训练 Layer2（三专家）
-
-单折：
-
-```powershell
-python scripts/train/train_layer2.py `
-  --exp configs/2d/exp/exp_prostate_local.yaml `
-  --training configs/2d/training_layer2.yaml `
-  --models configs/2d/models.yaml `
-  --augs configs/2d/augs.yaml `
-  --fold 0 --gpus 0,1
-```
-
-全 5 折：
-
-```powershell
 foreach ($fold in 0..4) {
   python scripts/train/train_layer2.py `
-    --exp configs/2d/exp/exp_prostate_local.yaml `
-    --training configs/2d/training_layer2.yaml `
-    --models configs/2d/models.yaml `
-    --augs configs/2d/augs.yaml `
-    --fold $fold --gpus 0,1
+    --exp configs/2d/exp/exp_prostate_local.yaml --training configs/2d/training_layer2.yaml `
+    --models configs/2d/models.yaml --augs configs/2d/augs.yaml --fold $fold --gpus 0,1
 }
-```
 
----
-
-## 7. 生成 Layer2 OOF（训练 Gating 的前提）
-
-```powershell
 python scripts/inference/generate_layer2_oof.py `
-  --exp configs/2d/exp/exp_prostate_local.yaml `
-  --models configs/2d/models.yaml `
-  --which best `
-  --batch-size 32 `
-  --tta
+  --exp configs/2d/exp/exp_prostate_local.yaml --models configs/2d/models.yaml `
+  --which best --batch-size 32 --tta
+
+foreach ($fold in 0..4) {
+  python scripts/train/train_gating.py `
+    --exp configs/2d/exp/exp_prostate_local.yaml --gating-config configs/2d/gating.yaml `
+    --models configs/2d/models.yaml --fold $fold --gpus 0,1
+}
+
+python scripts/eval/eval_methods.py `
+  --exp configs/2d/exp/exp_prostate_local.yaml --training configs/2d/training_layer2.yaml `
+  --models configs/2d/models.yaml --fold 0
+python scripts/eval/export_tables.py --exp configs/2d/exp/exp_prostate_local.yaml --folds 0
 ```
 
-输出（默认）：
-- `runs/segmoe_2d_prostate/cache/oof/layer2/fold_*/{sample_id}.npz`
-- `runs/segmoe_2d_prostate/cache/oof/layer2/oof_manifest_layer2.jsonl`
+**显存参考（双 RTX 5090，BF16）**：nnUNet ~12GB | SwinUNETR 25M bs=16 ~14GB | SegResNet 29M bs=32 ~8GB
 
 ---
 
-## 8. 训练 Gating（动态融合）
+## 3. 3D 实验（Prostate / Liver 通用流程）
 
-单折：
+以下以 **Liver** 配置为例，Prostate 3D 只需替换变量：
 
 ```powershell
-python scripts/train/train_gating.py `
-  --exp configs/2d/exp/exp_prostate_local.yaml `
-  --gating-config configs/2d/gating.yaml `
-  --models configs/2d/models.yaml `
-  --fold 0 --gpus 0,1
+# Liver 3D（当前数据集）
+$EXP="configs/3d/exp/exp_liver_3d.yaml"; $MODELS="configs/3d/models_3d_liver.yaml"; $DS_ID=3
+
+# Prostate 3D（切换时用这行）
+# $EXP="configs/3d/exp/exp_prostate_local_3d.yaml"; $MODELS="configs/3d/models_3d.yaml"; $DS_ID=2
 ```
 
-全 5 折：
+**执行顺序**：smoke test → 数据切分 → nnUNet Task → nnUNet训练 → Swin训练 → SegResNet训练 → 导入权重(×3) → Layer1 OOF → Layer2 → Layer2 OOF → Gating → 评估
+
+**入口说明（重要）**：
+- **Layer1 正式训练** 使用官方入口：`nnUNetv2_train`、`scripts/monai/train_swinunetr_official_3d.py`、`scripts/monai/train_segresnet_official_3d.py`。
+- **Step 1 的 `train_layer1_3d.py --smoke` 仅用于快速环境自检**，不是正式 Layer1 结果来源。
+- **Layer2 训练** 使用工程统一入口：`scripts/train/train_layer2_3d.py` + `configs/3d/training_layer2_3d.yaml`。
+
+### Step 1：Smoke Test（5 分钟，验证环境）
+
+> 说明：此步只做管线联通性检查（数据读取、前向、loss、保存），不替代 Step 4/5/6 的官方专家训练。
+
+```powershell
+python scripts/train/train_layer1_3d.py `
+  --exp $EXP --training configs/3d/training.yaml --models $MODELS `
+  --augs configs/3d/augs_3d.yaml --fold 0 --gpus 0 --smoke
+```
+
+### Step 2：数据切分（仅需一次）
+
+```powershell
+# Liver（自动发现 case，无需 --source-splits）
+python scripts/data/make_splits_3d.py --dataset-config configs/3d/datasets/liver_3d.yaml
+
+# Prostate 3D（从 2D splits 衍生）
+# python scripts/data/make_splits_3d.py `
+#   --dataset-config configs/3d/datasets/prostate_local_3d.yaml `
+#   --source-splits data/splits/prostate_local/splits_train5fold_testfixed.jsonl
+```
+
+### Step 3：nnUNet Task 初始化（仅需一次）
+
+```powershell
+# Liver
+python scripts/nnunet/setup_nnunet_task.py `
+  --data-dir D:\Dataset003_v2_LiverTumorSeg --dataset-id 3 `
+  --dataset-name v2_LiverTumorSeg `
+  --channel-names channel0 --labels background lab1 `
+  --nnunet-base nnunet_data --verify
+
+# Prostate 3D（取消注释使用）
+# python scripts/nnunet/setup_nnunet_task.py `
+#   --data-dir E:/nnunetv2_WebUI/nnUNet_raw/Dataset002_ProstateCrop_seg `
+#   --dataset-id 2 --dataset-name ProstateCrop_Seg `
+#   --channel-names T2w ADC DWI --labels background PZ TZ lesion `
+#   --nnunet-base nnunet_data --verify
+```
+
+### Step 4：nnUNet 3D 训练
+
+```powershell
+nnUNetv2_plan_and_preprocess -d $DS_ID --verify_dataset_integrity
+
+foreach ($fold in 0..4) { nnUNetv2_train $DS_ID 3d_fullres $fold --npz }  # 续训加 --c
+
+python scripts/nnunet/import_nnunet_weights_3d.py `
+  --nnunet-base nnunet_data --dataset-id $DS_ID --config 3d_fullres `
+  --folds 0 1 2 3 4 --exp $EXP --models $MODELS `
+  --expert-name nnunet-3d --update-models-yaml $MODELS
+```
+
+### Step 5：SwinUNETR 3D 训练
+
+保存路径：`runs/swinunetr_official_3d_{dataset_name}/fold{k}/`  
+（Liver: `swinunetr_official_3d_liver_3d` · Prostate 3D: `swinunetr_official_3d_prostate_local_3d`）
 
 ```powershell
 foreach ($fold in 0..4) {
-  python scripts/train/train_gating.py `
-    --exp configs/2d/exp/exp_prostate_local.yaml `
-    --gating-config configs/2d/gating.yaml `
-    --models configs/2d/models.yaml `
-    --fold $fold --gpus 0,1
+  python scripts/monai/train_swinunetr_official_3d.py `
+    --exp $EXP --models $MODELS --fold $fold --gpus 0 `
+    --epochs 300 --batch-size 2 --amp --amp-dtype bfloat16 --num-workers 2
+    # 续训加: --resume "runs/swinunetr_official_3d_liver_3d/fold$fold/latest_model.pt"
+}
+foreach ($fold in 0..4) {
+  python scripts/monai/import_swinunetr_weights_3d.py `
+    --source "runs/swinunetr_official_3d_liver_3d/fold$fold/best_model.pt" `
+    --exp $EXP --models $MODELS --fold $fold --expert-name swinunetr-3d
 }
 ```
 
----
+### Step 6：SegResNet 3D 训练
 
-## 9. 门控推理与评估导出
-
-### 9.1 Gating 推理（可导出门控权重可视化）
+保存路径：`runs/segresnet_official_3d_{dataset_name}/fold{k}/`
 
 ```powershell
-python scripts/inference/gating_inference.py `
-  --exp configs/2d/exp/exp_prostate_local.yaml `
-  --gating-config configs/2d/gating.yaml `
-  --models configs/2d/models.yaml `
-  --fold 0 --save-weights
+foreach ($fold in 0..4) {
+  python scripts/monai/train_segresnet_official_3d.py `
+    --exp $EXP --models $MODELS --fold $fold --gpus 0 `
+    --epochs 300 --batch-size 2 --dsdepth 2 --amp --amp-dtype bfloat16 --num-workers 2
+    # 续训加: --resume "runs/segresnet_official_3d_liver_3d/fold$fold/latest_model.pt"
+}
+foreach ($fold in 0..4) {
+  python scripts/monai/import_segresnet_weights_3d.py `
+    --source "runs/segresnet_official_3d_liver_3d/fold$fold/best_model.pt" `
+    --exp $EXP --models $MODELS --fold $fold --expert-name segresnet-3d
+}
 ```
 
-### 9.2 缓存概率图（可选）
+### Step 7：Layer1 OOF → Layer2 → Layer2 OOF → Gating → 评估
+
+> 说明：Step 7 开始，Layer1 使用的是 Step 4/5/6 导入后的官方专家权重；Layer2 由统一训练器 `train_layer2_3d.py` 按工程配置训练。
 
 ```powershell
-python scripts/inference/cache_probs.py `
-  --exp configs/2d/exp/exp_prostate_local.yaml `
-  --models configs/2d/models.yaml `
-  --layer layer1 --fold 0
+python scripts/inference/generate_layer1_oof_3d.py --exp $EXP --models $MODELS --which best
 
-python scripts/inference/cache_probs.py `
-  --exp configs/2d/exp/exp_prostate_local.yaml `
-  --models configs/2d/models.yaml `
-  --layer layer2 --fold 0
+foreach ($fold in 0..4) {
+  python scripts/train/train_layer2_3d.py `
+    --exp $EXP --training configs/3d/training_layer2_3d.yaml `
+    --models $MODELS --augs configs/3d/augs_3d.yaml --fold $fold --gpus 0
+}
+
+python scripts/inference/generate_layer2_oof_3d.py --exp $EXP --models $MODELS --which best
+
+foreach ($fold in 0..4) {
+  python scripts/train/train_gating_3d.py `
+    --exp $EXP --gating-config configs/3d/gating_3d.yaml --models $MODELS --fold $fold --gpus 0
+}
+
+python scripts/eval/eval_3d.py --exp $EXP --models $MODELS --gating-config configs/3d/gating_3d.yaml
 ```
 
-### 9.3 评估并导出表格
+**TensorBoard**：`tensorboard --logdir runs/ --port 6006`
 
-```powershell
-python scripts/eval/eval_methods.py `
-  --exp configs/2d/exp/exp_prostate_local.yaml `
-  --training configs/2d/training_layer2.yaml `
-  --models configs/2d/models.yaml `
-  --fold 0
+**显存参考（单 RTX 5090 32GB，BF16，roi=128×128×64）**：  
+nnUNet ~14GB | SwinUNETR 62M ~22GB（`use_checkpoint=true`） | SegResNet 15M ~10GB
 
-python scripts/eval/export_tables.py --exp configs/2d/exp/exp_prostate_local.yaml --folds 0
-python scripts/eval/export_weights.py --exp configs/2d/exp/exp_prostate_local.yaml --models configs/2d/models.yaml --folds 0
-```
-
----
-
-## 10. 推荐执行顺序（最简版）
-
-```text
-prepare_prostate.py
-  -> make_splits.py
-  -> setup_nnunet_task.py
-  -> nnUNetv2_train (5 folds)
-  -> train_swinunetr_official.py (5 folds)
-  -> train_segresnet_official.py (5 folds)
-  -> import_nnunet_weights.py
-  -> import_swinunetr_weights.py
-  -> import_segresnet_weights.py
-  -> generate_layer1_oof.py
-  -> train_layer2.py (5 folds)
-  -> generate_layer2_oof.py
-  -> train_gating.py (5 folds)
-  -> gating_inference.py / eval_methods.py / export_tables.py
-```
-
----
-
-## 11. 常见问题
-
-### Q1：我明明跑 2D，为什么 nnUNet 用的是 3D NIfTI？
-
-这是官方设计：
-- 输入文件是 3D NIfTI（保留体数据和 spacing 信息）
-- 训练配置选择 `2d`（`nnUNetv2_train <id> 2d <fold>`）
-- nnUNet 内部完成 2D 切片训练
-
-### Q2：这会影响 OOF 吗？
-
-不会。OOF 的关键是 fold 隔离和 `sample_id` 对齐。只要你按本 README 的链路生成 OOF，
-Layer2/Gating 使用的是统一对齐后的 OOF 缓存。
-
-### Q3：如何快速验证流程是否跑通？
-
-可先单折（`--fold 0`）跑完整链路，确认成功后再扩展到 5 折。
-
----
-
-## 12. 相关文档
-
-- `docs/TRAINING_PROSTATE.md`：前列腺专题训练说明（补充版）
-- `docs/ARCH_2D.md`：2D 架构说明
-- `docs/ROADMAP_3D.md`：3D 规划

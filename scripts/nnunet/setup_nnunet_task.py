@@ -21,7 +21,7 @@ Usage:
 
     # 已有 nnUNet 格式数据 (新增: 如前列腺数据)
     python scripts/nnunet/setup_nnunet_task.py \
-        --data-dir D:/Dataset002_ProstateCrop_Seg \
+        --data-dir E:/nnunetv2_WebUI/nnUNet_raw/Dataset002_ProstateCrop_seg \
         --dataset-id 2 --dataset-name ProstateCrop_Seg \
         --channel-names T2w ADC DWI \
         --labels background PZ TZ lesion \
@@ -29,7 +29,7 @@ Usage:
 
     # 自定义 nnUNet 数据目录
     python scripts/nnunet/setup_nnunet_task.py \
-        --data-dir D:/Dataset002_ProstateCrop_Seg \
+        --data-dir E:/nnunetv2_WebUI/nnUNet_raw/Dataset002_ProstateCrop_seg \
         --dataset-id 2 --dataset-name ProstateCrop_Seg \
         --channel-names T2w ADC DWI \
         --labels background PZ TZ lesion \

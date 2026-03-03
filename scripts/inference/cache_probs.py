@@ -1,5 +1,5 @@
 """
-Cache per-sample softmax probability maps [K, M, H, W] as .npz files.
+Cache per-sample logit maps [K, M, H, W] as .npz files.
 
 Usage:
     python scripts/inference/cache_probs.py \
@@ -60,7 +60,7 @@ def main() -> None:
     cache_dtype_str = str(exp_cfg.get("layering", {}).get("cache_dtype", "float16")).lower()
     cache_dtype = np.float16 if cache_dtype_str in {"float16", "fp16", "f16"} else np.float32
 
-    out_root = cache_root / f"{args.layer}_probs" / dataset_cfg["name"]
+    out_root = cache_root / f"{args.layer}_logits" / dataset_cfg["name"]
     ensure_dir(out_root)
 
     rows = _load_splits(dataset_cfg)
@@ -105,14 +105,14 @@ def main() -> None:
             if args.skip_existing and out_path.exists():
                 continue
 
-            probs_k = []
+            logits_k = []
             for model in expert_models:
                 with torch.no_grad():
                     logits = model(img_t.to(device))
-                    probs = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
-                probs_k.append(probs.astype(cache_dtype))
+                    logit_np = logits.detach().cpu().numpy()[0]
+                logits_k.append(logit_np.astype(cache_dtype))
 
-            np.savez_compressed(out_path, probs=np.stack(probs_k, axis=0))
+            np.savez_compressed(out_path, logits=np.stack(logits_k, axis=0))
 
 
 if __name__ == "__main__":

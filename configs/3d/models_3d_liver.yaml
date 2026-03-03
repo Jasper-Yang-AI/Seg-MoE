@@ -1,0 +1,39 @@
+# 3D 三专家配置 — Liver Tumor Segmentation (Dataset003_v2_LiverTumorSeg)
+# 单通道输入 (image_channels=1), 2类 (background/liver_tumor)
+#
+# 显存估算 (BF16, roi=128x128x64, bs=2):
+#   SegResNet3D  init_filters=32:  ~10 GB  (~15M params)
+#   SwinUNETR3D  feature_size=48:  ~22 GB  (~62M params, use_checkpoint=True)
+#   nnUNet3D     5-stage:          ~14 GB  (~32M params)
+
+experts_3d:
+  - name: segresnet-3d
+    type: segresnet
+    params:
+      spatial_dims: 3
+      init_filters: 32
+      blocks_down: [1, 2, 2, 4]
+      blocks_up: [1, 1, 1]
+      dropout_prob: 0.2
+      norm: "instance"
+      act: "relu"
+
+  - name: swinunetr-3d
+    type: swin_unetr
+    params:
+      spatial_dims: 3
+      feature_size: 48
+      depths: [2, 2, 2, 2]
+      num_heads: [3, 6, 12, 24]
+      use_checkpoint: true      # gradient checkpointing → 节约显存 ~30%
+
+  - name: nnunet-3d
+    type: nnunet
+    params:
+      conv_op: Conv3d
+      n_stages: 5
+      features_per_stage: [32, 64, 128, 256, 320]
+      patch_size: [128, 128, 64]
+      deep_supervision: false
+      n_conv_per_stage_encoder: [2, 2, 2, 2, 2]
+      n_conv_per_stage_decoder: [2, 2, 2, 2]

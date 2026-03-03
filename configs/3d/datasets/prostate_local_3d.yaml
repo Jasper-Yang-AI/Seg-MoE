@@ -1,0 +1,41 @@
+name: "prostate_local_3d"
+
+task:
+  # 前列腺分割: 0=background, 1/2/3 = 前列腺区域 (PZ/TZ/lesion)
+  num_classes: 4
+  include_background_in_mean: false
+  ignore_index: null
+  label_map:
+    0: 0
+    1: 1
+    2: 2
+    3: 3
+
+paths:
+  # nnUNet raw NIfTI volumes (imagesTr/*_000{0,1,2}.nii.gz + labelsTr/*.nii.gz)
+  raw_dir:       "E:/nnunetv2_WebUI/nnUNet_raw/Dataset002_ProstateCrop_seg"
+  splits_dir:    "data/splits/prostate_local_3d"
+
+raw_structure:
+  images_tr_dir: "imagesTr"
+  labels_tr_dir: "labelsTr"
+  images_ts_dir: "imagesTs"
+  labels_ts_dir: "labelsTs"
+  # multi-modal suffix pattern: _0000.nii.gz, _0001.nii.gz, _0002.nii.gz
+  modality_suffixes: ["_0000.nii.gz", "_0001.nii.gz", "_0002.nii.gz"]
+
+input:
+  image_channels: 3          # 3-modality MRI → stacked as C=3
+  spatial_size: [128, 128, 64]   # training crop size [H, W, D]
+  # Sliding-window inference ROI (must match spatial_size)
+  roi_size: [128, 128, 64]
+
+intensity:
+  mode: "percentile"          # per-volume, per-channel percentile clip + z-score
+  percentile_clip: [0.5, 99.5]
+
+split:
+  type: "train_5fold_test_fixed"
+  folds: 5
+  seed: 42
+  group_key: "patient_id"

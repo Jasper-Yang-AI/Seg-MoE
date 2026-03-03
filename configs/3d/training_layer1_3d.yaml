@@ -1,0 +1,46 @@
+# 3D Layer1 专家训练配置 (RTX 5090, 前列腺 4-class)
+# 策略: 深度监督关闭, BF16 AMP, 梯度累积 → effective_bs=4
+
+lr: 2.0e-4
+epochs: 300
+batch_size: 2
+gradient_accumulation_steps: 2     # effective BS = 4
+
+optimizer:
+  name: "adamw"
+  weight_decay: 1.0e-5
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  name: "cosine"
+  warmup_epochs: 20
+  min_lr: 1.0e-6
+
+amp:
+  enabled: true
+  dtype: "bfloat16"
+
+loss:
+  ce_weight: 1.0
+  dice_weight: 1.0
+  dice_smooth: 1.0
+  # No deep supervision in layer1 3D (memory constraint)
+  deep_supervision: false
+
+checkpoint:
+  monitor: "val_dice_mean"
+
+logging:
+  log_interval: 10
+
+dataloader:
+  num_workers: 2           # Windows safe
+  pin_memory: true
+  persistent_workers: false
+
+sliding_window:
+  roi_size: [128, 128, 64]
+  sw_batch_size: 2
+  overlap: 0.5
+  mode: "gaussian"

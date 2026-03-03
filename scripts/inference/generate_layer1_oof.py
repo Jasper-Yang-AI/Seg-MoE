@@ -1,5 +1,5 @@
 """
-Generate Layer1 Out-of-Fold (OOF) probability predictions.
+Generate Layer1 Out-of-Fold (OOF) logit predictions.
 
 For each fold k, loads the layer1 checkpoints trained on train_fold{k}
 and predicts on val_fold{k}.  This ensures no data leakage for Layer2 training.
@@ -123,30 +123,29 @@ def main() -> None:
         ds = SegmentationDataset2D(val_rows, dataset_cfg, augs_cfg=None, is_train=False, limit=args.limit)
         dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
 
-        for img_batch, _, meta_batch in tqdm(dl, desc=f"OOF fold{fold}"):
+            for img_batch, _, meta_batch in tqdm(dl, desc=f"OOF fold{fold}"):
             # img_batch: [B, C, H, W]
             B = img_batch.shape[0]
             ids = meta_batch["id"] if isinstance(meta_batch["id"], list) else [meta_batch["id"]]
             if len(ids) != B:
                 ids = [ids[0]] * B  # fallback for single-element batch
 
-            # ── Collect per-sample expert probs for the entire batch ──
-            batch_expert_probs = []  # List[np.ndarray], each [B, M, H, W]
+            # ── Collect per-sample expert logits for the entire batch ──
+            batch_expert_logits = []  # List[np.ndarray], each [B, M, H, W]
             for model in expert_models:
                 with torch.no_grad():
                     logits = model(img_batch.to(device))  # [B, M, H, W]
-                    probs = torch.softmax(logits, dim=1)
 
                     if args.tta:
                         # Horizontal flip
                         logits_h = model(torch.flip(img_batch.to(device), dims=[-1]))
-                        probs_h = torch.softmax(torch.flip(logits_h, dims=[-1]), dim=1)
+                        logits_h = torch.flip(logits_h, dims=[-1])
                         # Vertical flip
                         logits_v = model(torch.flip(img_batch.to(device), dims=[-2]))
-                        probs_v = torch.softmax(torch.flip(logits_v, dims=[-2]), dim=1)
-                        probs = (probs + probs_h + probs_v) / 3.0
+                        logits_v = torch.flip(logits_v, dims=[-2])
+                        logits = (logits + logits_h + logits_v) / 3.0
 
-                    batch_expert_probs.append(probs.cpu().numpy())  # [B, M, H, W]
+                    batch_expert_logits.append(logits.cpu().numpy())  # [B, M, H, W]
 
             # ── Save per-sample ──
             for b_idx in range(B):
@@ -173,8 +172,8 @@ def main() -> None:
                     all_records.append(existing_map.get(k, rec))
                     continue
 
-                probs_k = [ep[b_idx].astype(cache_dtype) for ep in batch_expert_probs]
-                np.savez_compressed(out_path, probs=np.stack(probs_k, axis=0))
+                logits_k = [el[b_idx].astype(cache_dtype) for el in batch_expert_logits]
+                np.savez_compressed(out_path, logits=np.stack(logits_k, axis=0))
                 all_records.append(rec)
 
     merged = dict(existing_map)

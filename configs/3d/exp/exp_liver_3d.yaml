@@ -1,0 +1,33 @@
+# Seg-MoE 3D Liver Tumor Segmentation Experiment
+exp_name: "segmoe_3d_liver"
+
+seed: 42
+
+deterministic:
+  torch_deterministic: true
+  cudnn_benchmark: false
+
+dataset:
+  name: "liver_3d"
+  config: "configs/3d/datasets/liver_3d.yaml"
+
+methods:
+  - single
+  - mean_ensemble
+  - gating
+
+layering:
+  cache_root: "runs/${exp_name}/cache"
+  cache_dtype: "float16"
+  use_oof_for_layer2: true
+  # Layer1 OOF (volumes → logits [K, M, D, H, W])
+  oof_cache_dir:     "runs/${exp_name}/cache/oof/layer1"
+  oof_manifest_path: "runs/${exp_name}/cache/oof/layer1/oof_manifest.jsonl"
+  # Layer2 OOF (volumes → logits [K, M, D, H, W])
+  l2_oof_cache_dir:     "runs/${exp_name}/cache/oof/layer2"
+  l2_oof_manifest_path: "runs/${exp_name}/cache/oof/layer2/oof_manifest_layer2.jsonl"
+
+output:
+  run_dir:     "runs/${exp_name}"
+  results_dir: "runs/${exp_name}/results"
+  tables_dir:  "runs/${exp_name}/tables"

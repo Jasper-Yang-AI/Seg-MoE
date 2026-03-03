@@ -17,17 +17,18 @@ def _compute_distance_map(target_1h: torch.Tensor) -> torch.Tensor:
     Replaces scipy.ndimage.distance_transform_edt for GPU tensors.
 
     Args:
-        target_1h: [B, C, H, W] float one-hot
+        target_1h: [B, C, ...] float one-hot (2D or 3D)
 
     Returns:
-        dist_map: [B, C, H, W] signed distance (negative inside, positive outside)
+        dist_map: [B, C, ...] signed distance (negative inside, positive outside)
     """
     try:
         from scipy.ndimage import distance_transform_edt
     except ImportError:
         raise ImportError("scipy is required for Boundary Loss. pip install scipy")
 
-    B, C, H, W = target_1h.shape
+    B, C = target_1h.shape[:2]
+    spatial_shape = target_1h.shape[2:]
     device = target_1h.device
     target_np = target_1h.detach().cpu().numpy()
     dist = torch.zeros_like(target_1h)
@@ -47,7 +48,7 @@ def _compute_distance_map(target_1h: torch.Tensor) -> torch.Tensor:
             pos_dist = distance_transform_edt(1 - fg)
             neg_dist = distance_transform_edt(fg)
             # Normalize by image diagonal for scale invariance
-            diag = (H**2 + W**2) ** 0.5
+            diag = float(sum(int(s) ** 2 for s in spatial_shape) ** 0.5)
             signed = (pos_dist - neg_dist) / (diag + 1e-8)
             dist[b, c] = torch.from_numpy(signed).float()
 

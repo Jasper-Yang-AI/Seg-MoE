@@ -1,5 +1,5 @@
 """
-Generate Layer2 Out-of-Fold (OOF) probability predictions.
+Generate Layer2 Out-of-Fold (OOF) logit predictions.
 
 正确流程:  Layer1 train → L1 OOF → Layer2 train → **L2 OOF** → Gating train → Eval
 
@@ -10,7 +10,7 @@ and predicts on val_fold{k}.  Layer2 experts take concatenated input:
 The L1 OOF probs are already generated (no leakage) and serve as
 the additional channels for Layer2 input.
 
-Output: cache/oof/layer2/fold_{k}/{sample_id}.npz  — probs shape [K, M, H, W]
+Output: cache/oof/layer2/fold_{k}/{sample_id}.npz  — logits shape [K, M, H, W]
 Manifest: cache/oof/layer2/oof_manifest_layer2.jsonl
 
 Usage:
@@ -73,7 +73,7 @@ def _find_folds(rows: list[dict]) -> list[int]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Generate Layer2 OOF probability predictions")
+    ap = argparse.ArgumentParser(description="Generate Layer2 OOF logit predictions")
     ap.add_argument("--exp", required=True, help="Experiment config")
     ap.add_argument("--models", required=True, help="Expert model config")
     ap.add_argument("--which", choices=["best", "last"], default="best")
@@ -85,11 +85,8 @@ def main() -> None:
                     help="Enable Test-Time Augmentation (horizontal + vertical flip)")
     ap.add_argument("--no-uncertainty", action="store_true",
                     help="Disable uncertainty channels (match Layer2 training)")
-    ap.add_argument("--no-save-logits", action="store_true",
-                    help="Skip saving raw logits (smaller files, but gating will use log-odds fallback)")
     ap.add_argument("--skip-existing", action="store_true")
     args = ap.parse_args()
-    args.save_logits = not args.no_save_logits  # logits saved by default
 
     exp_cfg = load_config(args.exp)
     dataset_cfg = load_config(exp_cfg["dataset"]["config"])
@@ -199,28 +196,23 @@ def main() -> None:
                 ids = [ids[0]] * B
 
             # ── Collect per-expert Layer2 predictions ──
-            batch_expert_probs = []   # List[np.ndarray], each [B, M, H, W]
-            batch_expert_logits = []  # List[np.ndarray], each [B, M, H, W]; populated only when --save-logits
+            batch_expert_logits = []  # List[np.ndarray], each [B, M, H, W]
             for model in expert_models:
                 with torch.no_grad():
                     raw_logits = model(x_batch.to(device))  # [B, M, H, W]
-                    probs = torch.softmax(raw_logits, dim=1)
 
                     if args.tta:
                         # Horizontal flip
                         x_h = torch.flip(x_batch.to(device), dims=[-1])
                         logits_h = model(x_h)
-                        probs_h = torch.softmax(torch.flip(logits_h, dims=[-1]), dim=1)
+                        logits_h = torch.flip(logits_h, dims=[-1])
                         # Vertical flip
                         x_v = torch.flip(x_batch.to(device), dims=[-2])
                         logits_v = model(x_v)
-                        probs_v = torch.softmax(torch.flip(logits_v, dims=[-2]), dim=1)
-                        probs = (probs + probs_h + probs_v) / 3.0
+                        logits_v = torch.flip(logits_v, dims=[-2])
+                        raw_logits = (raw_logits + logits_h + logits_v) / 3.0
 
-                    batch_expert_probs.append(probs.cpu().numpy())   # [B, M, H, W]
-                    if args.save_logits:
-                        # Save raw logits (no TTA — deterministic, single-pass)
-                        batch_expert_logits.append(raw_logits.cpu().numpy())  # [B, M, H, W]
+                    batch_expert_logits.append(raw_logits.cpu().numpy())  # [B, M, H, W]
 
             # ── Save per-sample ──
             for b_idx in range(B):
@@ -234,7 +226,7 @@ def main() -> None:
                     "predictor_fold": int(fold),
                     "split": val_split,
                     "prob_path": rel_path.as_posix(),
-                    "has_logits": args.save_logits,
+                    "has_logits": True,
                     "num_classes": int(num_classes),
                     "num_experts": len(expert_cfgs),
                     "experts": list(ckpt_map.keys()),
@@ -254,12 +246,8 @@ def main() -> None:
                     all_records.append(existing_map.get(k, rec))
                     continue
 
-                probs_k = [ep[b_idx].astype(cache_dtype) for ep in batch_expert_probs]
-                save_kwargs: Dict[str, Any] = {"probs": np.stack(probs_k, axis=0)}  # [K,M,H,W]
-                if args.save_logits:
-                    logits_k = [el[b_idx].astype(np.float32) for el in batch_expert_logits]
-                    save_kwargs["logits"] = np.stack(logits_k, axis=0)  # [K,M,H,W] float32
-                np.savez_compressed(out_path, **save_kwargs)
+                logits_k = [el[b_idx].astype(cache_dtype) for el in batch_expert_logits]
+                np.savez_compressed(out_path, logits=np.stack(logits_k, axis=0))
                 all_records.append(rec)
 
     # ── Save manifest ──
