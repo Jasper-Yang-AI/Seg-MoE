@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -75,6 +76,29 @@ def _check_nnunet_installed() -> bool:
         return True
     except ImportError:
         return False
+
+
+def _remove_existing_target_dir(target_dir: Path) -> None:
+    """Remove existing target dir safely on both Windows and Linux.
+
+    On Windows, prefer `rmdir` first so junctions are unlinked without touching
+    underlying source data. If that fails, fallback to shutil.rmtree.
+    """
+    if not target_dir.exists():
+        return
+
+    if target_dir.is_symlink():
+        target_dir.unlink(missing_ok=True)
+        return
+
+    if sys.platform == "win32":
+        try:
+            subprocess.run(["cmd", "/c", "rmdir", str(target_dir)], check=True, capture_output=True)
+            return
+        except Exception:
+            pass
+
+    shutil.rmtree(target_dir, ignore_errors=True)
 
 
 def _create_dataset_json(
@@ -223,15 +247,10 @@ def main() -> None:
 
         if target_dir.exists():
             if args.overwrite:
-                import shutil
                 print(f"  Removing existing: {target_dir}")
-                shutil.rmtree(target_dir, ignore_errors=True)
-            elif target_dir.is_symlink() or target_dir.is_junction():
-                print(f"  Symlink already exists: {target_dir}")
+                _remove_existing_target_dir(target_dir)
             else:
-                print(f"⚠️  Found existing dataset: {target_dir}")
-                print(f"   Use --overwrite to recreate.")
-                sys.exit(1)
+                print(f"  Using existing dataset dir: {target_dir}")
 
         if not target_dir.exists():
             # Create junction (Windows) or symlink (Linux)

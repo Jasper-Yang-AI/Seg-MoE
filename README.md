@@ -182,6 +182,26 @@ python scripts/data/make_splits_3d.py --dataset-config configs/3d/datasets/liver
 
 ### Step 3：nnUNet Task 初始化（仅需一次）
 
+> 若 `nnUNetv2_plan_and_preprocess --verify_dataset_integrity` 报错：
+> `Spacing mismatch between segmentation and corresponding images`，先执行：
+
+> 若报错为 `Shape mismatch`（如 image 是 2D/少切片，seg 是 3D），
+> 用 `--quarantine-invalid` 自动隔离坏样本（不参与训练）：
+
+```powershell
+python scripts/data/fix_nnunet_spacing_mismatch.py `
+  --dataset-root D:/Seg-MoE/nnunet_data/nnUNet_raw/Dataset003_v2_LiverTumorSeg
+
+# 确认输出后再真正修复
+python scripts/data/fix_nnunet_spacing_mismatch.py `
+  --dataset-root D:/Seg-MoE/nnunet_data/nnUNet_raw/Dataset003_v2_LiverTumorSeg --apply
+
+# 同时隔离 shape/dim 不匹配的无效样本
+python scripts/data/fix_nnunet_spacing_mismatch.py `
+  --dataset-root D:/Seg-MoE/nnunet_data/nnUNet_raw/Dataset003_v2_LiverTumorSeg `
+  --apply --quarantine-invalid
+```
+
 ```powershell
 # Liver
 python scripts/nnunet/setup_nnunet_task.py `
