@@ -149,6 +149,13 @@ def train_model(
     epochs = int(training_cfg["epochs"])
     grad_accum_steps = int(training_cfg.get("gradient_accumulation_steps", 1))
     log_interval = int(training_cfg.get("logging", {}).get("log_interval", 20))
+    val_interval = max(1, int(training_cfg.get("logging", {}).get("val_interval", 1)))
+
+    early_stop_cfg = training_cfg.get("early_stopping", {}) or {}
+    early_stop_enabled = bool(early_stop_cfg.get("enabled", False))
+    early_stop_patience = max(1, int(early_stop_cfg.get("patience", 10)))
+    early_stop_min_epochs = max(0, int(early_stop_cfg.get("min_epochs", 0)))
+    early_stop_min_delta = float(early_stop_cfg.get("min_delta", 0.0))
 
     # ---- Optimizer (AdamW / Adam / SGD) ----
     opt_cfg = training_cfg.get("optimizer", {}) or {}
@@ -188,7 +195,7 @@ def train_model(
     amp_dtype = torch.bfloat16 if amp_dtype_name in {"bf16", "bfloat16"} else torch.float16
     # BF16 动态范围等同 FP32, 不需要 GradScaler; FP16 才需要
     use_scaler = amp_enabled and (amp_dtype == torch.float16)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_scaler)
 
     # ---- State ----
     best_metric = -1.0
@@ -197,6 +204,7 @@ def train_model(
     start_epoch = 1
     global_step = 0
     nan_count = 0
+    epochs_since_improvement = 0
 
     model.to(device)
 
@@ -237,6 +245,11 @@ def train_model(
                     best_metric = float(state["best_metric"])
                 except Exception:
                     pass
+            if "epochs_since_improvement" in state:
+                try:
+                    epochs_since_improvement = int(state["epochs_since_improvement"])
+                except Exception:
+                    pass
             if resume_path.name.lower() == "best.pt":
                 best_path = str(resume_path)
             print(f"[resume] Loaded {resume_path} | epoch→{start_epoch} best={best_metric:.4f} global_step={global_step}")
@@ -252,10 +265,17 @@ def train_model(
         f"Training [{tag}] | device={device} | GPUs={gpu_count} | DP={is_dp} | "
         f"params={n_params:.1f}M | epochs={epochs} | bs={training_cfg.get('batch_size','?')} | "
         f"lr={lr} | opt={opt_name} | amp={amp_enabled}({amp_dtype_name}) | "
-        f"grad_accum={grad_accum_steps} | scheduler={sched_name}"
+        f"grad_accum={grad_accum_steps} | scheduler={sched_name} | val_interval={val_interval}"
     )
     print(header)
     flog.info(header)
+    if early_stop_enabled:
+        flog.info(
+            "Early stopping enabled: patience=%d min_epochs=%d min_delta=%.6f",
+            early_stop_patience,
+            early_stop_min_epochs,
+            early_stop_min_delta,
+        )
 
     # ---- Build loss function (B3: supports ce_dice_boundary via config) ----
     loss_cfg = training_cfg.get("loss", {})
@@ -317,39 +337,59 @@ def train_model(
         writer.add_scalar("lr", opt.param_groups[0]["lr"], epoch)
 
         # ---- Validation ----
-        model.eval()
-        val_losses = []
-        val_metrics_accum = []
+        should_validate = (epoch % val_interval == 0) or (epoch == epochs)
+        val_loss: Optional[float] = None
+        agg: dict[str, float] = {}
+        val_dice: Optional[float] = None
+        current_metric: Optional[float] = None
 
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"val[{tag}] e{epoch}/{epochs}"):
-                img, mask, _ = _to_device(batch, device)
-                with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
-                    logits = model(img)
-                    loss = loss_fn(logits, mask)
-                val_losses.append(float(loss.item()))
-                probs = torch.softmax(logits, dim=1)
-                val_metrics_accum.append(compute_segmentation_metrics_batch(probs, mask, num_classes=num_classes))
+        if should_validate:
+            model.eval()
+            val_losses = []
+            val_metrics_accum = []
 
-        val_loss = float(np.mean(val_losses)) if val_losses else 0.0
-        agg = _aggregate_metrics(val_metrics_accum)
-        val_dice = float(agg.get("dice_mean", 0.0))
+            with torch.no_grad():
+                for batch in tqdm(val_loader, desc=f"val[{tag}] e{epoch}/{epochs}"):
+                    img, mask, _ = _to_device(batch, device)
+                    with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                        logits = model(img)
+                        loss = loss_fn(logits, mask)
+                    val_losses.append(float(loss.item()))
+                    probs = torch.softmax(logits, dim=1)
+                    val_metrics_accum.append(compute_segmentation_metrics_batch(probs, mask, num_classes=num_classes))
 
-        writer.add_scalar("loss/val", val_loss, epoch)
-        writer.add_scalar("metrics/val_dice_mean", val_dice, epoch)
+            val_loss = float(np.mean(val_losses)) if val_losses else 0.0
+            agg = _aggregate_metrics(val_metrics_accum)
+            val_dice = float(agg.get("dice_mean", 0.0))
+            writer.add_scalar("loss/val", val_loss, epoch)
+            writer.add_scalar("metrics/val_dice_mean", val_dice, epoch)
 
         epoch_time = time.time() - epoch_t0
         mem_str = _gpu_mem_mb()
-        log_line = (
-            f"epoch={epoch}/{epochs} train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-            f"val_dice={val_dice:.4f} lr={opt.param_groups[0]['lr']:.2e} "
-            f"time={epoch_time:.0f}s {mem_str}"
-        )
+        if should_validate and val_loss is not None and val_dice is not None:
+            log_line = (
+                f"epoch={epoch}/{epochs} train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+                f"val_dice={val_dice:.4f} lr={opt.param_groups[0]['lr']:.2e} "
+                f"time={epoch_time:.0f}s {mem_str}"
+            )
+        else:
+            log_line = (
+                f"epoch={epoch}/{epochs} train_loss={train_loss:.4f} val=skipped "
+                f"lr={opt.param_groups[0]['lr']:.2e} time={epoch_time:.0f}s {mem_str}"
+            )
         flog.info(log_line)
 
         # ---- Checkpoints: 统一保存去 module. 前缀的权重 ----
         monitor_key = training_cfg.get("checkpoint", {}).get("monitor", "val_dice_mean")
-        current_metric = float(agg.get(monitor_key.replace("val_", ""), val_dice))
+        improved = False
+        if should_validate:
+            current_metric = float(agg.get(monitor_key.replace("val_", ""), val_dice or 0.0))
+            if current_metric > (best_metric + early_stop_min_delta):
+                best_metric = current_metric
+                epochs_since_improvement = 0
+                improved = True
+            elif epoch >= early_stop_min_epochs:
+                epochs_since_improvement += 1
 
         raw_model_sd = unwrap_model(model).state_dict()
         save_dict = {
@@ -359,6 +399,7 @@ def train_model(
             "opt": opt.state_dict(),
             "metrics": agg,
             "best_metric": best_metric,
+            "epochs_since_improvement": epochs_since_improvement,
         }
         if scheduler is not None:
             save_dict["scheduler"] = scheduler.state_dict()
@@ -368,13 +409,21 @@ def train_model(
         last_path = str(ckpt_dir / "last.pt")
         torch.save(save_dict, last_path)
 
-        if current_metric > best_metric:
-            best_metric = current_metric
+        if improved:
             save_dict["best_metric"] = best_metric
             best_path = str(ckpt_dir / "best.pt")
             torch.save(save_dict, best_path)
-            print(f"  → New best: {monitor_key}={current_metric:.4f}")
-            flog.info(f"New best: {monitor_key}={current_metric:.4f}")
+            print(f"  → New best: {monitor_key}={best_metric:.4f}")
+            flog.info(f"New best: {monitor_key}={best_metric:.4f}")
+
+        if early_stop_enabled and should_validate and epoch >= early_stop_min_epochs and epochs_since_improvement >= early_stop_patience:
+            msg = (
+                f"Early stopping at epoch {epoch}: no improvement in {epochs_since_improvement} "
+                f"validation rounds on {monitor_key}"
+            )
+            print(msg)
+            flog.info(msg)
+            break
 
     writer.close()
     flog.info(f"Training complete. best_metric={best_metric:.4f}")

@@ -194,9 +194,14 @@ def main() -> None:
         patch_size=patch_size,
         stride=stride,
         hidden_dim=int(gcfg.get("hidden_dim", 64)),
+        score_hidden_dim=int(gcfg.get("score_hidden_dim", gcfg.get("hidden_dim", 64))),
         dropout=float(gcfg.get("dropout", 0.1)),
         per_class=bool(gcfg.get("per_class", False)),
         use_residual_head=bool(gcfg.get("use_residual_head", True)),
+        use_entropy=bool(gcfg.get("use_entropy", True)),
+        use_consensus_features=bool(gcfg.get("use_consensus_features", True)),
+        use_disagreement_features=bool(gcfg.get("use_disagreement_features", True)),
+        use_confidence_features=bool(gcfg.get("use_confidence_features", True)),
         temperature_start=float(gcfg.get("temperature_start", 2.0)),
         temperature_end=float(gcfg.get("temperature_end", 0.5)),
         load_balance_weight=float(gcfg.get("load_balance_weight", 0.01)),
@@ -291,20 +296,24 @@ def main() -> None:
         n_steps = 0
 
         pbar = tqdm(train_loader, desc=f"gating e{epoch}/{epochs}")
-        for logit_flat, logits_cache, mask in pbar:
-            logit_flat = logit_flat.to(device)           # [B, K*M, pH, pW]
+        for logits_cache, mask, sample_ids, positions in pbar:
             logits_cache = logits_cache.to(device)       # [B, K, M, pH, pW]
             mask = mask.to(device)                       # [B, pH, pW]
+            sample_ids = sample_ids.to(device)
+            positions = positions.to(device)
 
             with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
-                weights = model(logit_flat, temperature=τ)  # [B, K] or [B, K, M]
+                weights = model(logits_cache, temperature=τ)  # [B, K] or [B, K, M]
                 fused = _unwrap(model).fuse_logits(logits_cache, weights)  # [B, M, pH, pW]
 
                 seg_loss = seg_loss_fn(fused, mask)
 
                 w_per_expert = _unwrap(model).weights_per_expert(weights)  # [B, K]
                 lb_loss = compute_load_balance_loss(w_per_expert)
-                tv_loss = compute_spatial_smooth_loss(w_per_expert) if tv_weight > 0 else w_per_expert.new_tensor(0.0)
+                tv_loss = (
+                    compute_spatial_smooth_loss(w_per_expert, sample_ids=sample_ids, positions=positions)
+                    if tv_weight > 0 else w_per_expert.new_tensor(0.0)
+                )
 
                 loss = seg_loss + lb_weight * lb_loss + tv_weight * tv_loss
 
@@ -338,13 +347,12 @@ def main() -> None:
         val_dices: list[float] = []
 
         with torch.no_grad():
-            for logit_flat, logits_cache, mask in tqdm(val_loader, desc=f"val e{epoch}"):
-                logit_flat = logit_flat.to(device)
+            for logits_cache, mask, sample_ids, positions in tqdm(val_loader, desc=f"val e{epoch}"):
                 logits_cache = logits_cache.to(device)
                 mask = mask.to(device)
 
                 with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
-                    weights = model(logit_flat, temperature=τ)
+                    weights = model(logits_cache, temperature=τ)
                     fused = _unwrap(model).fuse_logits(logits_cache, weights)
                     loss = seg_loss_fn(fused, mask)
 
@@ -392,9 +400,14 @@ def main() -> None:
                 "num_experts": K, "num_classes": num_classes,
                 "patch_size": patch_size, "stride": stride,
                 "hidden_dim": gate_cfg.hidden_dim,
+                "score_hidden_dim": gate_cfg.score_hidden_dim,
                 "dropout": gate_cfg.dropout,
                 "per_class": gate_cfg.per_class,
                 "use_residual_head": gate_cfg.use_residual_head,
+                "use_entropy": gate_cfg.use_entropy,
+                "use_consensus_features": gate_cfg.use_consensus_features,
+                "use_disagreement_features": gate_cfg.use_disagreement_features,
+                "use_confidence_features": gate_cfg.use_confidence_features,
                 "blend_mode": gate_cfg.blend_mode,
             },
         }

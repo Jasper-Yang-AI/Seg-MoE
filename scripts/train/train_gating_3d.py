@@ -163,9 +163,14 @@ def main() -> None:
         patch_size=patch_size,
         stride=stride,
         hidden_dim=int(gcfg.get("hidden_dim", 64)),
+        score_hidden_dim=int(gcfg.get("score_hidden_dim", gcfg.get("hidden_dim", 64))),
         dropout=float(gcfg.get("dropout", 0.1)),
         per_class=bool(gcfg.get("per_class", False)),
         use_residual_head=bool(gcfg.get("use_residual_head", True)),
+        use_entropy=bool(gcfg.get("use_entropy", True)),
+        use_consensus_features=bool(gcfg.get("use_consensus_features", True)),
+        use_disagreement_features=bool(gcfg.get("use_disagreement_features", True)),
+        use_confidence_features=bool(gcfg.get("use_confidence_features", True)),
         temperature_start=float(gcfg.get("temperature_start", 2.0)),
         temperature_end=float(gcfg.get("temperature_end", 0.5)),
         load_balance_weight=float(gcfg.get("load_balance_weight", 0.01)),
@@ -243,18 +248,22 @@ def main() -> None:
         running_loss = running_lb = 0.0
         n_steps = 0
 
-        for logit_flat, logits_cache, mask in tqdm(train_loader, desc=f"e{epoch}/{epochs}"):
-            logit_flat   = logit_flat.to(device)       # [B, K*M, pd, ph, pw]
+        for logits_cache, mask, sample_ids, positions in tqdm(train_loader, desc=f"e{epoch}/{epochs}"):
             logits_cache = logits_cache.to(device)     # [B, K, M, pd, ph, pw]
-            mask         = mask.to(device)             # [B, pd, ph, pw]
+            mask = mask.to(device)                     # [B, pd, ph, pw]
+            sample_ids = sample_ids.to(device)
+            positions = positions.to(device)
 
             with torch.cuda.amp.autocast(enabled=amp_on, dtype=amp_dtype):
-                weights = model(logit_flat, temperature=tau)   # [B, K]
+                weights = model(logits_cache, temperature=tau)   # [B, K]
                 fused   = _unwrap(model).fuse_logits(logits_cache, weights)  # [B, M, ...]
                 seg_loss = seg_loss_fn(fused, mask)
                 w_per   = _unwrap(model).weights_per_expert(weights)
                 lb_loss  = compute_load_balance_loss_3d(w_per)
-                tv_loss  = compute_spatial_smooth_loss_3d(w_per) if tv_weight > 0 else w_per.new_tensor(0.0)
+                tv_loss  = (
+                    compute_spatial_smooth_loss_3d(w_per, sample_ids=sample_ids, positions=positions)
+                    if tv_weight > 0 else w_per.new_tensor(0.0)
+                )
                 loss = seg_loss + lb_weight * lb_loss + tv_weight * tv_loss
 
             if not torch.isfinite(loss):
@@ -282,12 +291,11 @@ def main() -> None:
         model.eval()
         val_losses, val_dices = [], []
         with torch.no_grad():
-            for logit_flat, logits_cache, mask in val_loader:
-                logit_flat   = logit_flat.to(device)
+            for logits_cache, mask, sample_ids, positions in val_loader:
                 logits_cache = logits_cache.to(device)
-                mask         = mask.to(device)
+                mask = mask.to(device)
                 with torch.cuda.amp.autocast(enabled=amp_on, dtype=amp_dtype):
-                    weights = model(logit_flat, temperature=tau)
+                    weights = model(logits_cache, temperature=tau)
                     fused   = _unwrap(model).fuse_logits(logits_cache, weights)
                     val_losses.append(float(seg_loss_fn(fused, mask).item()))
                 pred = fused.argmax(dim=1)
@@ -326,6 +334,11 @@ def main() -> None:
             "gate_cfg": {"num_experts": K, "num_classes": num_classes,
                          "patch_size": patch_size, "stride": stride,
                          "hidden_dim": gate_cfg.hidden_dim,
+                         "score_hidden_dim": gate_cfg.score_hidden_dim,
+                         "use_entropy": gate_cfg.use_entropy,
+                         "use_consensus_features": gate_cfg.use_consensus_features,
+                         "use_disagreement_features": gate_cfg.use_disagreement_features,
+                         "use_confidence_features": gate_cfg.use_confidence_features,
                          "per_class": gate_cfg.per_class},
         }
         torch.save(ckpt, last_ckpt)

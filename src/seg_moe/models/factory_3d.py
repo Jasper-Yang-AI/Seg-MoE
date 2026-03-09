@@ -36,7 +36,7 @@ def _build_segresnet_3d(in_channels: int, classes: int, params: Dict[str, Any]) 
         init_filters=params.get("init_filters", 32),
         blocks_down=params.get("blocks_down", [1, 2, 2, 4]),
         blocks_up=params.get("blocks_up", [1, 1, 1]),
-        dropout_prob=params.get("dropout_prob", 0.2),
+        dropout_prob=params.get("dropout_prob", 0.0),
     )
     if params.get("pretrained_path"):
         _load_weights(model, params["pretrained_path"], tag="SegResNet-3D")

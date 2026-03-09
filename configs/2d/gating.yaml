@@ -14,9 +14,14 @@
 gating:
   #  网络架构 
   hidden_dim: 64              # Conv 通道数 (~30-50K params total, K*M 输入通道)
+  score_hidden_dim: 64        # 专家打分 MLP 隐层
   dropout: 0.1
   per_class: false            # true = [K,M] per-class per-expert; false = [K] per-expert
   use_residual_head: true     # 残差 FC shortcut, 改善梯度流
+  use_entropy: true           # 从 logits 在线计算 entropy 作为置信度信号
+  use_consensus_features: true
+  use_disagreement_features: true
+  use_confidence_features: true
 
   #  Patch 参数 (256256 图像) 
   patch_size: 64              # 每 patch 6464

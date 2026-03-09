@@ -96,10 +96,28 @@ class _VolumeDataset3D(Dataset):
         self.transforms = monai_transforms
         self.is_train = is_train
         paths = dataset_cfg["paths"]
-        self.images_dir = Path(paths["images_dir"])
-        self.labels_dir = Path(paths["labels_dir"])
-        self.suffixes = dataset_cfg["input"].get(
-            "modality_suffixes", ["_0000.nii.gz", "_0001.nii.gz", "_0002.nii.gz"])
+        raw_structure = dataset_cfg.get("raw_structure", {}) or {}
+        raw_dir = paths.get("raw_dir")
+
+        if paths.get("images_dir") and paths.get("labels_dir"):
+            self.images_dir = Path(paths["images_dir"])
+            self.labels_dir = Path(paths["labels_dir"])
+        elif raw_dir:
+            raw_root = Path(raw_dir)
+            self.images_dir = raw_root / raw_structure.get("images_tr_dir", "imagesTr")
+            self.labels_dir = raw_root / raw_structure.get("labels_tr_dir", "labelsTr")
+        else:
+            raise KeyError("dataset_cfg.paths must define either images_dir/labels_dir or raw_dir with raw_structure")
+
+        self.suffixes = (
+            raw_structure.get("modality_suffixes")
+            or dataset_cfg.get("input", {}).get("modality_suffixes")
+            or ["_0000.nii.gz", "_0001.nii.gz", "_0002.nii.gz"])
+
+        if not self.images_dir.exists() or not self.labels_dir.exists():
+            raise FileNotFoundError(
+                f"3D dataset directories not found: images={self.images_dir}, labels={self.labels_dir}"
+            )
 
     def __len__(self):
         return len(self.rows)
@@ -108,19 +126,28 @@ class _VolumeDataset3D(Dataset):
         row = self.rows[idx]
         sid = str(row["id"])
         channels = []
-        for sfx in self.suffixes:
-            arr = sitk.GetArrayFromImage(sitk.ReadImage(str(self.images_dir / f"{sid}{sfx}"))).astype(np.float32)
+        image_paths = row.get("image_paths")
+        if image_paths:
+            paths = [Path(p) for p in image_paths]
+        else:
+            paths = [self.images_dir / f"{sid}{sfx}" for sfx in self.suffixes]
+
+        for path in paths:
+            arr = sitk.GetArrayFromImage(sitk.ReadImage(str(path))).astype(np.float32)
             lo, hi = np.percentile(arr, [0.5, 99.5])
             arr = np.clip(arr, lo, hi)
             arr = (arr - arr.mean()) / (arr.std() + 1e-8)
             channels.append(arr)
         img = np.stack(channels, axis=0)
-        mask = sitk.GetArrayFromImage(sitk.ReadImage(str(self.labels_dir / f"{sid}.nii.gz"))).astype(np.int64)
+        mask_path = Path(row.get("mask_path") or (self.labels_dir / f"{sid}.nii.gz"))
+        mask = sitk.GetArrayFromImage(sitk.ReadImage(str(mask_path))).astype(np.int64)
         mask = mask[np.newaxis, ...]
 
         if self.transforms is not None:
             data = self.transforms({"image": img, "label": mask})
             img, mask = data["image"], data["label"]
+
+        img, mask = self._pad_if_needed(img, mask)
 
         if self.is_train:
             img, mask = self._random_crop(img, mask)
@@ -130,6 +157,37 @@ class _VolumeDataset3D(Dataset):
             mask = torch.from_numpy(mask.copy())
         mask = mask.squeeze(0).long()
         return img, mask, {"id": sid}
+
+    def _pad_if_needed(self, img, mask):
+        rd, rh, rw = self.roi_size
+        _, d, h, w = img.shape
+        pad_d = max(0, rd - d)
+        pad_h = max(0, rh - h)
+        pad_w = max(0, rw - w)
+
+        if pad_d == 0 and pad_h == 0 and pad_w == 0:
+            return img, mask
+
+        pad_spec = (
+            (0, 0),
+            (pad_d // 2, pad_d - pad_d // 2),
+            (pad_h // 2, pad_h - pad_h // 2),
+            (pad_w // 2, pad_w - pad_w // 2),
+        )
+
+        if isinstance(img, np.ndarray):
+            img = np.pad(img, pad_spec, mode="constant")
+            mask = np.pad(mask, pad_spec, mode="constant")
+        else:
+            pad_flat = (
+                pad_w // 2, pad_w - pad_w // 2,
+                pad_h // 2, pad_h - pad_h // 2,
+                pad_d // 2, pad_d - pad_d // 2,
+            )
+            img = torch.nn.functional.pad(img, pad_flat, mode="constant", value=0)
+            mask = torch.nn.functional.pad(mask, pad_flat, mode="constant", value=0)
+
+        return img, mask
 
     def _random_crop(self, img, mask):
         if isinstance(img, np.ndarray):
@@ -176,7 +234,21 @@ def _build_train_transforms_3d() -> Compose:
 
 def _load_splits(dataset_cfg: dict) -> list[dict]:
     path = Path(dataset_cfg["paths"]["splits_dir"]) / "splits_train5fold_testfixed.jsonl"
-    return load_jsonl(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Splits not found: {path}. Run make_splits_3d.py first.")
+    rows = load_jsonl(path)
+    valid_rows = []
+    dropped = 0
+    for row in rows:
+        image_paths = row.get("image_paths") or []
+        mask_path = row.get("mask_path")
+        if image_paths and mask_path and all(Path(p).exists() for p in image_paths) and Path(mask_path).exists():
+            valid_rows.append(row)
+        else:
+            dropped += 1
+    if dropped:
+        print(f"[splits] Dropped {dropped} invalid rows with missing image/mask files from {path}")
+    return valid_rows
 
 
 def _mean_dice_3d(logits, targets, num_classes):
@@ -203,6 +275,7 @@ def main() -> None:
     ap.add_argument("--warmup-epochs", type=int, default=3, help="Official: 3")
     ap.add_argument("--dsdepth", type=int, default=2, help="Deep supervision depth (official: 2)")
     ap.add_argument("--gpus", type=str, default=None)
+    ap.add_argument("--amp", action="store_true", default=True, help="Enable AMP")
     ap.add_argument("--amp-dtype", choices=["float16", "bfloat16"], default="bfloat16")
     ap.add_argument("--val-interval", type=int, default=5)
     ap.add_argument("--num-workers", type=int, default=2)
@@ -308,8 +381,9 @@ def main() -> None:
         _sched_kwargs["warmup_multiplier"] = 0.1
     scheduler = WarmupCosineSchedule(optimizer, **_sched_kwargs)
 
+    amp_enabled = bool(args.amp and device.type == "cuda")
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float16
-    scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_enabled and amp_dtype == torch.float16))
     writer = SummaryWriter(log_dir=str(fold_dir / "tb_logs"))
 
     start_epoch, best_dice = 0, 0.0
@@ -319,16 +393,19 @@ def main() -> None:
         raw.load_state_dict(ckpt["model"], strict=True)
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt.get("epoch", 0)
         best_dice = ckpt.get("best_metric", 0.0)
         print(f"  Resumed from epoch {start_epoch}, best_dice={best_dice:.4f}")
 
-    grad_accum = args.grad_accum
+    grad_accum = max(int(args.grad_accum), 1)
 
     print(f"\nTraining ({args.epochs} epochs) ...")
     for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_loss, step_count = 0.0, 0
+        accum_steps = 0
         t0 = time.time()
         optimizer.zero_grad(set_to_none=True)
 
@@ -336,7 +413,7 @@ def main() -> None:
             batch_img = batch_img.to(device)
             batch_mask = batch_mask.to(device).unsqueeze(1)
 
-            with torch.amp.autocast("cuda", dtype=amp_dtype):
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
                 logits = model(batch_img)
             if isinstance(logits, (list, tuple)):
                 logits_fp32 = [l.float() for l in logits]
@@ -348,21 +425,33 @@ def main() -> None:
                 continue
 
             scaler.scale(loss).backward()
-            if (si + 1) % grad_accum == 0:
+            accum_steps += 1
+            if accum_steps >= grad_accum:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                accum_steps = 0
 
             epoch_loss += loss.item() * grad_accum
             step_count += 1
 
+        if accum_steps > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
         # Epoch-level scheduler step
-        scheduler.step()
+        if step_count > 0:
+            scheduler.step()
         avg_loss = epoch_loss / max(step_count, 1)
         elapsed = time.time() - t0
         writer.add_scalar("train/loss", avg_loss, epoch)
+
+        writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch)
 
         if (epoch + 1) % args.val_interval == 0 or epoch == args.epochs - 1:
             model.eval()
@@ -371,7 +460,7 @@ def main() -> None:
             with torch.no_grad():
                 for vi, vm, _ in val_dl:
                     vi, vm = vi.to(device), vm.to(device)
-                    with torch.amp.autocast("cuda", dtype=amp_dtype):
+                    with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
                         vl = sliding_window_inference(vi, roi_size, 2, raw_model,
                                                       overlap=0.5, mode="gaussian")
                     # vl may be list (DS); take first
@@ -388,6 +477,7 @@ def main() -> None:
                 "model": raw.state_dict(), "epoch": epoch + 1,
                 "best_metric": max(best_dice, val_dice),
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
                 "config": {"in_channels": in_channels, "num_classes": num_classes,
                            "segresnet_params": params, "dsdepth": args.dsdepth},
                 "source": "monai_segresnet_official_3d",

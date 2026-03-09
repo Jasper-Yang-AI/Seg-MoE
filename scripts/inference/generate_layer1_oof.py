@@ -123,7 +123,7 @@ def main() -> None:
         ds = SegmentationDataset2D(val_rows, dataset_cfg, augs_cfg=None, is_train=False, limit=args.limit)
         dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
 
-            for img_batch, _, meta_batch in tqdm(dl, desc=f"OOF fold{fold}"):
+        for img_batch, _, meta_batch in tqdm(dl, desc=f"OOF fold{fold}"):
             # img_batch: [B, C, H, W]
             B = img_batch.shape[0]
             ids = meta_batch["id"] if isinstance(meta_batch["id"], list) else [meta_batch["id"]]

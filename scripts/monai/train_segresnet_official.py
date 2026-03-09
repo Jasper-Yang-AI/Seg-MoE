@@ -429,9 +429,9 @@ def main() -> None:
 
     # ── AMP ──
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float16
-    # GradScaler: always enabled with AMP — catches inf/NaN grads and auto-skips bad steps.
-    # On Ampere+ (SM>=80) GradScaler works correctly with bfloat16 too.
-    use_scaler = args.amp
+    # GradScaler only needed for float16; bfloat16 has the same exponent range as float32
+    # and does not suffer from underflow, so scaling is unnecessary (and misleading).
+    use_scaler = args.amp and amp_dtype == torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
     # ── TensorBoard ──

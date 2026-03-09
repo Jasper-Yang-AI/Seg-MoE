@@ -1,13 +1,10 @@
-"""
-3D Gating Patch Dataset — loads Layer2 OOF logits [K, M, D, H, W] and GT masks,
-splits into 3D patches, returns (logit_flat, logits_struct, mask_patch).
+"""3D gating patch dataset backed by Layer2 OOF logits caches.
 
-Mirror of gating_patch_dataset.py but fully 3D.
-
-Return shapes per __getitem__:
-    logit_flat : [K*M, pD, pH, pW]   — gating network input
-    logits     : [K,  M, pD, pH, pW] — weighted fusion  
-    mask       : [pD, pH, pW]         — GT patch  (int64)
+Each sample returns:
+    logits_patch: [K, M, pD, pH, pW]
+    mask_patch:   [pD, pH, pW]
+    sample_idx:   scalar int64 tensor
+    pos:          [3] int64 tensor with patch origin (d, h, w)
 """
 from __future__ import annotations
 
@@ -106,8 +103,8 @@ class GatingPatchDataset3D(Dataset):
             self.samples = self.samples[:limit]
 
         # Build flat patch index
-        self._patch_index: List[Tuple[int, Tuple[int, int, int]]] = []   # (sample_idx, (d,h,w))
-        self._fg_index: List[int] = []     # indices into _patch_index with foreground
+        self._patch_index: List[Tuple[int, Tuple[int, int, int]]] = []
+        self._fg_index: List[int] = []
 
         # We need to peek at a volume to get spatial shape for patch positions
         # Defer until first use to avoid loading all volumes at init
@@ -118,28 +115,15 @@ class GatingPatchDataset3D(Dataset):
         if self._patch_index:
             return
 
-        for si, s in enumerate(self.samples):
-            sid = str(s["id"])
-            oof_rec = self.oof_map[sid]
-            data = np.load(str(oof_rec.prob_path))
-            key = "logits" if "logits" in data else "probs"
-            vol = data[key]                     # [K, M, D, H, W] or [K, M, H, W]
-            if vol.ndim == 4:                   # old 2D-style format
-                _, _, H, W = vol.shape
-                spatial = (1, H, W)
-            else:
-                _, _, D, H, W = vol.shape
-                spatial = (D, H, W)
-
+        for si, _sample in enumerate(self.samples):
+            logits, mask = self._load_sample(si)
+            spatial = tuple(int(v) for v in logits.shape[2:])
             positions = compute_patch_positions_3d(spatial, self.patch_size, self.stride)
             for pos in positions:
                 pidx = len(self._patch_index)
                 self._patch_index.append((si, pos))
-
-                # Check foreground
-                if self.fg_ratio > 0 and "mask_path" in s:
-                    pass   # lazy FG detection done at runtime
-                else:
+                mask_patch = _extract_3d_patch(mask, pos, self.patch_size)
+                if (mask_patch > 0).any():
                     self._fg_index.append(pidx)
 
         if not self._fg_index:
@@ -204,12 +188,11 @@ class GatingPatchDataset3D(Dataset):
 
         logit_patch = _extract_3d_patch(logits, pos, self.patch_size)   # [K, M, pd, ph, pw]
         mask_patch = _extract_3d_patch(mask, pos, self.patch_size)       # [pd, ph, pw]
-
-        logit_flat = logit_patch.reshape(self.K * self.M, *self.patch_size)   # [K*M, pd, ph, pw]
-        logits_struct = logit_patch                                             # [K,  M, pd, ph, pw]
+        logits_struct = logit_patch
 
         return (
-            torch.from_numpy(logit_flat).float(),
             torch.from_numpy(np.ascontiguousarray(logits_struct)).float(),
             torch.from_numpy(mask_patch).long(),
+            torch.tensor(si, dtype=torch.long),
+            torch.tensor(list(pos), dtype=torch.long),
         )

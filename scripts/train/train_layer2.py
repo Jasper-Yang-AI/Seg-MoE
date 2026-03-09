@@ -165,10 +165,21 @@ def main() -> None:
     bs = int((merged.get("training", {}) or {}).get("batch_size", training_cfg.get("batch_size", 8)))
     epochs = int((merged.get("training", {}) or {}).get("epochs", training_cfg.get("epochs", 300)))
 
-    nw = int(training_cfg.get("dataloader", {}).get("num_workers", _DEFAULT_NUM_WORKERS))
-    pm = bool(training_cfg.get("dataloader", {}).get("pin_memory", True))
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=nw, pin_memory=pm)
-    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=nw, pin_memory=pm)
+    dl_cfg = training_cfg.get("dataloader", {}) or {}
+    nw = int(dl_cfg.get("num_workers", _DEFAULT_NUM_WORKERS))
+    pm = bool(dl_cfg.get("pin_memory", True))
+    persistent_workers = bool(dl_cfg.get("persistent_workers", False)) if nw > 0 else False
+    loader_kwargs = {
+        "batch_size": bs,
+        "num_workers": nw,
+        "pin_memory": pm,
+        "persistent_workers": persistent_workers,
+    }
+    if nw > 0 and dl_cfg.get("prefetch_factor") is not None:
+        loader_kwargs["prefetch_factor"] = int(dl_cfg["prefetch_factor"])
+
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
     # ── B4: Per-expert training overrides ──
     # training_layer2.yaml can have an `expert_overrides` section:

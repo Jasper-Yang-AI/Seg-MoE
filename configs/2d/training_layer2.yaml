@@ -27,6 +27,8 @@ gradient_accumulation_steps: 1
 dataloader:
   num_workers: 2
   pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 3
 
 loss:
   name: "ce_dice_boundary"
@@ -42,7 +44,13 @@ checkpoint:
 
 logging:
   log_interval: 20
-  val_interval: 1
+  val_interval: 2
+
+early_stopping:
+  enabled: true
+  patience: 12
+  min_epochs: 20
+  min_delta: 5.0e-4
 
 # ── B4: Per-expert training overrides ──
 # 按照各 expert 的官方训练 recipe 做差分化配置

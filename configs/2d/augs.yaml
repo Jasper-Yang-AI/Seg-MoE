@@ -7,10 +7,10 @@ train:
     p: 0.5
   - name: "VerticalFlip"
     p: 0.5
-  - name: "ShiftScaleRotate"
-    shift_limit: 0.1
-    scale_limit: 0.15
-    rotate_limit: 20
+  - name: "Affine"
+    translate_percent: [-0.1, 0.1]
+    scale: [0.85, 1.15]
+    rotate: [-20, 20]
     border_mode: 0
     p: 0.5
   - name: "ElasticTransform"
@@ -28,7 +28,7 @@ train:
     contrast_limit: 0.2
     p: 0.4
   - name: "GaussNoise"
-    var_limit: [5.0, 30.0]
+    std_range: [0.009, 0.022]
     p: 0.3
   - name: "GaussianBlur"
     blur_limit: [3, 5]
@@ -36,13 +36,10 @@ train:
 
   # ---- 正则化 (Cutout) ----
   - name: "CoarseDropout"
-    max_holes: 8
-    max_height: 32
-    max_width: 32
-    min_holes: 2
-    min_height: 8
-    min_width: 8
-    fill_value: 0
+    num_holes_range: [2, 8]
+    hole_height_range: [8, 32]
+    hole_width_range: [8, 32]
+    fill: 0
     p: 0.3
 
 val:

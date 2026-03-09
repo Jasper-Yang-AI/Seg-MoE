@@ -32,7 +32,6 @@ sota_experts:
       init_filters: 32
       blocks_down: [1, 2, 2, 4]
       blocks_up: [1, 1, 1]
-      dropout_prob: 0.2
 
 # Ensemble
 ensemble_strategy:

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 import warnings
@@ -99,11 +100,29 @@ class _VolumeDataset3D(Dataset):
         self.is_train = is_train
 
         paths = dataset_cfg["paths"]
-        self.images_dir = Path(paths["images_dir"])
-        self.labels_dir = Path(paths["labels_dir"])
-        self.suffixes = dataset_cfg["input"].get(
-            "modality_suffixes", ["_0000.nii.gz", "_0001.nii.gz", "_0002.nii.gz"]
+        raw_structure = dataset_cfg.get("raw_structure", {}) or {}
+        raw_dir = paths.get("raw_dir")
+
+        if paths.get("images_dir") and paths.get("labels_dir"):
+            self.images_dir = Path(paths["images_dir"])
+            self.labels_dir = Path(paths["labels_dir"])
+        elif raw_dir:
+            raw_root = Path(raw_dir)
+            self.images_dir = raw_root / raw_structure.get("images_tr_dir", "imagesTr")
+            self.labels_dir = raw_root / raw_structure.get("labels_tr_dir", "labelsTr")
+        else:
+            raise KeyError("dataset_cfg.paths must define either images_dir/labels_dir or raw_dir with raw_structure")
+
+        self.suffixes = (
+            raw_structure.get("modality_suffixes")
+            or dataset_cfg.get("input", {}).get("modality_suffixes")
+            or ["_0000.nii.gz", "_0001.nii.gz", "_0002.nii.gz"]
         )
+
+        if not self.images_dir.exists() or not self.labels_dir.exists():
+            raise FileNotFoundError(
+                f"3D dataset directories not found: images={self.images_dir}, labels={self.labels_dir}"
+            )
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -114,8 +133,13 @@ class _VolumeDataset3D(Dataset):
 
         # Load multi-modal images
         channels = []
-        for sfx in self.suffixes:
-            path = self.images_dir / f"{sid}{sfx}"
+        image_paths = row.get("image_paths")
+        if image_paths:
+            paths = [Path(p) for p in image_paths]
+        else:
+            paths = [self.images_dir / f"{sid}{sfx}" for sfx in self.suffixes]
+
+        for path in paths:
             arr = sitk.GetArrayFromImage(sitk.ReadImage(str(path))).astype(np.float32)
             # Percentile clip + z-score
             lo, hi = np.percentile(arr, [0.5, 99.5])
@@ -125,7 +149,7 @@ class _VolumeDataset3D(Dataset):
             channels.append(arr)
         img = np.stack(channels, axis=0)  # [C, D, H, W]
 
-        mask_path = self.labels_dir / f"{sid}.nii.gz"
+        mask_path = Path(row.get("mask_path") or (self.labels_dir / f"{sid}.nii.gz"))
         mask = sitk.GetArrayFromImage(sitk.ReadImage(str(mask_path))).astype(np.int64)
         mask = mask[np.newaxis, ...]  # [1, D, H, W]
 
@@ -133,6 +157,8 @@ class _VolumeDataset3D(Dataset):
         if self.transforms is not None:
             data = self.transforms({"image": img, "label": mask})
             img, mask = data["image"], data["label"]
+
+        img, mask = self._pad_if_needed(img, mask)
 
         # Random crop for training
         if self.is_train:
@@ -145,28 +171,60 @@ class _VolumeDataset3D(Dataset):
         mask = mask.squeeze(0).long()  # [D, H, W]
         return img.float(), mask, {"id": sid}
 
+    def _pad_if_needed(self, img, mask):
+        rd, rh, rw = self.roi_size
+        _, d, h, w = img.shape
+        pad_d = max(0, rd - d)
+        pad_h = max(0, rh - h)
+        pad_w = max(0, rw - w)
+
+        if pad_d == 0 and pad_h == 0 and pad_w == 0:
+            return img, mask
+
+        pad_spec = (
+            (0, 0),
+            (pad_d // 2, pad_d - pad_d // 2),
+            (pad_h // 2, pad_h - pad_h // 2),
+            (pad_w // 2, pad_w - pad_w // 2),
+        )
+
+        if isinstance(img, np.ndarray):
+            img = np.pad(img, pad_spec, mode="constant")
+            mask = np.pad(mask, pad_spec, mode="constant")
+        else:
+            pad_flat = (
+                pad_w // 2, pad_w - pad_w // 2,
+                pad_h // 2, pad_h - pad_h // 2,
+                pad_d // 2, pad_d - pad_d // 2,
+            )
+            img = torch.nn.functional.pad(img, pad_flat, mode="constant", value=0)
+            mask = torch.nn.functional.pad(mask, pad_flat, mode="constant", value=0)
+
+        return img, mask
+
     def _random_crop(self, img, mask):
         """RandCropByPosNegLabel-style: 2/3 foreground, 1/3 any."""
-        import torch as _t
         if isinstance(img, np.ndarray):
             C, D, H, W = img.shape
         else:
             C, D, H, W = img.shape
         rd, rh, rw = self.roi_size
 
-        if D <= rd:
-            pd = 0
-        elif isinstance(mask, np.ndarray) and np.random.rand() < 0.67:
+        if isinstance(mask, np.ndarray) and np.random.rand() < 0.67:
             fg = np.argwhere(mask[0] > 0)
             if len(fg) > 0:
                 idx = fg[np.random.randint(len(fg))]
-                pd = max(0, min(idx[0] - rd // 2, D - rd))
+                pd = max(0, min(idx[0] - rd // 2, D - rd)) if D > rd else 0
+                ph = max(0, min(idx[1] - rh // 2, H - rh)) if H > rh else 0
+                pw = max(0, min(idx[2] - rw // 2, W - rw)) if W > rw else 0
             else:
-                pd = np.random.randint(0, max(D - rd, 1))
+                pd = np.random.randint(0, max(D - rd, 1)) if D > rd else 0
+                ph = np.random.randint(0, max(H - rh, 1)) if H > rh else 0
+                pw = np.random.randint(0, max(W - rw, 1)) if W > rw else 0
         else:
-            pd = np.random.randint(0, max(D - rd, 1))
-        ph = np.random.randint(0, max(H - rh, 1)) if H > rh else 0
-        pw = np.random.randint(0, max(W - rw, 1)) if W > rw else 0
+            pd = np.random.randint(0, max(D - rd, 1)) if D > rd else 0
+            ph = np.random.randint(0, max(H - rh, 1)) if H > rh else 0
+            pw = np.random.randint(0, max(W - rw, 1)) if W > rw else 0
 
         img = img[:, pd:pd+rd, ph:ph+rh, pw:pw+rw]
         mask = mask[:, pd:pd+rd, ph:ph+rh, pw:pw+rw]
@@ -181,7 +239,7 @@ def _build_train_transforms_3d() -> Compose:
         RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
         RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
         RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
-        RandRotate90d(keys=["image", "label"], prob=0.5, spatial_axes=(0, 1)),
+        RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3, spatial_axes=(1, 2)),
         RandScaleIntensityd(keys=["image"], factors=0.1, prob=0.5),
         RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.5),
     ])
@@ -195,7 +253,19 @@ def _load_splits(dataset_cfg: dict) -> list[dict]:
     path = splits_dir / "splits_train5fold_testfixed.jsonl"
     if not path.exists():
         raise FileNotFoundError(f"Splits not found: {path}. Run make_splits_3d.py first.")
-    return load_jsonl(path)
+    rows = load_jsonl(path)
+    valid_rows = []
+    dropped = 0
+    for row in rows:
+        image_paths = row.get("image_paths") or []
+        mask_path = row.get("mask_path")
+        if image_paths and mask_path and all(Path(p).exists() for p in image_paths) and Path(mask_path).exists():
+            valid_rows.append(row)
+        else:
+            dropped += 1
+    if dropped:
+        print(f"[splits] Dropped {dropped} invalid rows with missing image/mask files from {path}")
+    return valid_rows
 
 
 def _mean_dice_3d(logits: torch.Tensor, targets: torch.Tensor, num_classes: int) -> float:
@@ -224,6 +294,7 @@ def main() -> None:
     ap.add_argument("--weight-decay", type=float, default=1e-5, help="Official: 1e-5")
     ap.add_argument("--warmup-epochs", type=int, default=50, help="Official: 50")
     ap.add_argument("--gpus", type=str, default=None)
+    ap.add_argument("--amp", action="store_true", default=True, help="Enable AMP")
     ap.add_argument("--amp-dtype", choices=["float16", "bfloat16"], default="bfloat16")
     ap.add_argument("--val-interval", type=int, default=5)
     ap.add_argument("--num-workers", type=int, default=2)
@@ -328,15 +399,18 @@ def main() -> None:
                         num_workers=args.num_workers, pin_memory=True,
                         persistent_workers=_persistent)
 
-    # Scheduler (step-level warmup cosine)
-    steps_per_epoch = max(len(train_dl), 1)
+    grad_accum = max(int(args.grad_accum), 1)
+
+    # Scheduler (step-level warmup cosine, synced to real optimizer updates)
+    steps_per_epoch = max(math.ceil(len(train_dl) / grad_accum), 1)
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = steps_per_epoch * args.warmup_epochs
     scheduler = WarmupCosineSchedule(optimizer, warmup_steps=warmup_steps, t_total=total_steps)
 
     # AMP
+    amp_enabled = bool(args.amp and device.type == "cuda")
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float16
-    scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_enabled and amp_dtype == torch.float16))
 
     writer = SummaryWriter(log_dir=str(fold_dir / "tb_logs"))
 
@@ -355,13 +429,12 @@ def main() -> None:
         best_dice = ckpt.get("best_metric", 0.0)
         print(f"  Resumed from epoch {start_epoch}, best_dice={best_dice:.4f}")
 
-    grad_accum = args.grad_accum
-
     print(f"\nTraining ({args.epochs} epochs) ...")
     for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_loss = 0.0
         step_count = 0
+        accum_steps = 0
         t0 = time.time()
         optimizer.zero_grad(set_to_none=True)
 
@@ -369,7 +442,7 @@ def main() -> None:
             batch_img = batch_img.to(device)
             batch_mask = batch_mask.to(device).unsqueeze(1)  # [B,1,D,H,W]
 
-            with torch.amp.autocast("cuda", dtype=amp_dtype):
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
                 logits = model(batch_img)
             loss = loss_fn(logits.float(), batch_mask) / grad_accum
 
@@ -377,16 +450,26 @@ def main() -> None:
                 continue
 
             scaler.scale(loss).backward()
-            if (si + 1) % grad_accum == 0:
+            accum_steps += 1
+            if accum_steps >= grad_accum:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
+                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                accum_steps = 0
 
-            scheduler.step()
             epoch_loss += loss.item() * grad_accum
             step_count += 1
+
+        if accum_steps > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
 
         avg_loss = epoch_loss / max(step_count, 1)
         elapsed = time.time() - t0
@@ -402,7 +485,7 @@ def main() -> None:
                 for vi, vm, _ in val_dl:
                     vi = vi.to(device)
                     vm = vm.to(device)
-                    with torch.amp.autocast("cuda", dtype=amp_dtype):
+                    with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled):
                         vl = sliding_window_inference(
                             vi, roi_size, 2, raw_model,
                             overlap=0.5, mode="gaussian"

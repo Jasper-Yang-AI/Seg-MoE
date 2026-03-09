@@ -6,9 +6,14 @@ gating:
   patch_size: [32, 32, 16]   # 3D patch size (D, H, W)
   stride:     [16, 16, 8]    # 50% overlap
   hidden_dim: 64
+  score_hidden_dim: 64
   dropout: 0.1
   per_class: false            # False → [B, K] weights; True → [B, K, M]
   use_residual_head: true
+  use_entropy: true
+  use_consensus_features: true
+  use_disagreement_features: true
+  use_confidence_features: true
   blend_mode: "gaussian"      # gaussian | average
 
   # Temperature annealing: τ 2.0 → 0.5 (训练初期均匀探索, 后期锐化)
