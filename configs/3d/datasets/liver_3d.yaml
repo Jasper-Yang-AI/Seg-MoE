@@ -25,8 +25,8 @@ raw_structure:
 
 input:
   image_channels: 1          # 单通道 MRI
-  spatial_size: [128, 128, 64]   # 训练 crop size [H, W, D]
-  roi_size:     [128, 128, 64]   # sliding-window 推理 ROI
+  spatial_size: [160, 160, 32]   # 统一 3D crop size [H, W, D]
+  roi_size:     [160, 160, 32]   # unified sliding-window 推理 ROI
 
 intensity:
   mode: "percentile"          # per-volume percentile clip + z-score

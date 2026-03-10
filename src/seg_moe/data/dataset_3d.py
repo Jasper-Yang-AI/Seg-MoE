@@ -25,6 +25,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from seg_moe.utils.spatial import parse_3d_size
+
 
 # ---------------------------------------------------------------------------
 # Intensity helpers
@@ -189,7 +191,7 @@ class SegmentationDataset3D(Dataset):
         self.is_train = is_train
 
         sz = dataset_cfg["input"]["spatial_size"]
-        self.spatial_size = tuple(int(s) for s in sz)    # (H, W, D)
+        self.spatial_size = parse_3d_size(sz)
 
         intens = dataset_cfg.get("intensity", {})
         self.lo = float((intens.get("percentile_clip") or [0.5, 99.5])[0])

@@ -293,6 +293,6 @@ python scripts/eval/eval_3d.py --exp $EXP --models $MODELS --gating-config confi
 
 **TensorBoard**：`tensorboard --logdir runs/ --port 6006`
 
-**显存参考（单 RTX 5090 32GB，BF16，roi=128×128×64）**：  
+**显存参考（单 RTX 5090 32GB，BF16，roi=160×160×32）**：  
 nnUNet ~14GB | SwinUNETR 62M ~22GB（`use_checkpoint=true`） | SegResNet 15M ~10GB
 

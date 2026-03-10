@@ -73,6 +73,7 @@ from monai.transforms import (
 from seg_moe.utils.config import load_config
 from seg_moe.utils.io import load_jsonl
 from seg_moe.utils.seed import seed_everything
+from seg_moe.utils.spatial import parse_3d_size
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -328,7 +329,7 @@ def main() -> None:
     params = swin_cfg.get("params", {})
     num_classes = int(dataset_cfg["task"]["num_classes"])
     in_channels = int(dataset_cfg["input"].get("image_channels", 3))
-    roi_size = tuple(int(x) for x in dataset_cfg["input"].get("roi_size", [128, 128, 64]))
+    roi_size = parse_3d_size(dataset_cfg["input"].get("roi_size", [128, 128, 64]))
 
     # Output
     if args.output_dir:

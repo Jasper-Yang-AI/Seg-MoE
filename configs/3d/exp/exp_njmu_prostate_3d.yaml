@@ -1,0 +1,31 @@
+# Seg-MoE 3D NJMU prostate experiment
+exp_name: "segmoe_3d_njmu_prostate"
+
+seed: 42
+
+deterministic:
+  torch_deterministic: true
+  cudnn_benchmark: false
+
+dataset:
+  name: "njmu_prostate_3d"
+  config: "configs/3d/datasets/njmu_prostate_3d.yaml"
+
+methods:
+  - single
+  - mean_ensemble
+  - gating
+
+layering:
+  cache_root: "runs/${exp_name}/cache"
+  cache_dtype: "float16"
+  use_oof_for_layer2: true
+  oof_cache_dir: "runs/${exp_name}/cache/oof/layer1"
+  oof_manifest_path: "runs/${exp_name}/cache/oof/layer1/oof_manifest.jsonl"
+  l2_oof_cache_dir: "runs/${exp_name}/cache/oof/layer2"
+  l2_oof_manifest_path: "runs/${exp_name}/cache/oof/layer2/oof_manifest_layer2.jsonl"
+
+output:
+  run_dir: "runs/${exp_name}"
+  results_dir: "runs/${exp_name}/results"
+  tables_dir: "runs/${exp_name}/tables"

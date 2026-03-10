@@ -26,9 +26,9 @@ raw_structure:
 
 input:
   image_channels: 3          # 3-modality MRI → stacked as C=3
-  spatial_size: [128, 128, 64]   # training crop size [H, W, D]
+  spatial_size: [160, 160, 32]   # unified 3D training crop size [H, W, D]
   # Sliding-window inference ROI (must match spatial_size)
-  roi_size: [128, 128, 64]
+  roi_size: [160, 160, 32]
 
 intensity:
   mode: "percentile"          # per-volume, per-channel percentile clip + z-score

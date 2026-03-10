@@ -4,7 +4,7 @@
 #
 # 硬件优化要点 (RTX 5090 / Blackwell):
 #   - BF16 混合精度 (原生 Tensor Core 支持, 比 FP16 更稳定, 无需 GradScaler)
-#   - bs=2 + grad_accum=2 → 等效 bs=4 (3D 128³ patch, SwinUNETR 约 22GB)
+#   - bs=2 + grad_accum=2 → 等效 bs=4 (3D 160x160x32 patch, SwinUNETR 单卡可训练)
 #   - num_workers=2 (Windows 下稳定), prefetch_factor=3 (提升 IO 吞吐)
 #   - persistent_workers=true (减少 worker 启动开销)
 #   - Boundary Loss 提升边缘精度 (Kervadec et al. MIDL 2019)
@@ -52,7 +52,7 @@ dataloader:
   prefetch_factor: 3
 
 sliding_window:
-  roi_size: [128, 128, 64]
+  roi_size: [160, 160, 32]
   sw_batch_size: 2
   overlap: 0.5
   mode: "gaussian"

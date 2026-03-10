@@ -1,7 +1,7 @@
 # 3D 三专家配置 (RTX 5090 32GB BF16 优化)
 # 三专家: SegResNet3D (CNN-ResEncoder) + SwinUNETR3D (Transformer) + nnUNet PlainConvUNet3D (CNN)
 #
-# 显存估算 (BF16, roi=128x128x64, bs=2):
+# 显存估算 (BF16, roi=160x160x32, bs=2):
 #   SegResNet3D  init_filters=32:  ~10 GB  (~15M params)
 #   SwinUNETR3D  feature_size=48:  ~22 GB  (~62M params, use_checkpoint=True)  [单卡]
 #   nnUNet3D     5-stage:          ~14 GB  (~32M params)

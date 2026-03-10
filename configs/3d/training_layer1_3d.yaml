@@ -40,7 +40,7 @@ dataloader:
   persistent_workers: false
 
 sliding_window:
-  roi_size: [128, 128, 64]
+  roi_size: [160, 160, 32]
   sw_batch_size: 2
   overlap: 0.5
   mode: "gaussian"

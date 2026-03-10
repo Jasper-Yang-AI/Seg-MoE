@@ -31,6 +31,7 @@ from seg_moe.data.dataset_3d import (
     build_3d_transforms,
 )
 from seg_moe.data.oof import OOFRecord, load_oof_manifest
+from seg_moe.utils.spatial import parse_3d_size
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +96,7 @@ class Layer2OOFDataset3D(Dataset):
         self.is_train = is_train
 
         sz = dataset_cfg["input"]["spatial_size"]
-        self.spatial_size = tuple(int(s) for s in sz)
+        self.spatial_size = parse_3d_size(sz)
 
         intens = dataset_cfg.get("intensity", {})
         self.lo = float((intens.get("percentile_clip") or [0.5, 99.5])[0])

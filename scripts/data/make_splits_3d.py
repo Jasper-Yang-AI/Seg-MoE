@@ -37,9 +37,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-def _find_nifti_paths(raw_dir: Path, patient_id: str, modality_suffixes: List[str]) -> List[str]:
+def _resolve_subdir(root: Path, preferred: str, fallback: str) -> Path:
+    """Resolve a configured subdirectory, tolerating legacy casing differences."""
+    preferred_path = root / preferred
+    if preferred_path.exists():
+        return preferred_path
+
+    fallback_path = root / fallback
+    if fallback_path.exists():
+        return fallback_path
+
+    raise FileNotFoundError(
+        f"Neither configured subdir '{preferred}' nor fallback '{fallback}' exists under {root}"
+    )
+
+
+def _find_nifti_paths(images_dir: Path, patient_id: str, modality_suffixes: List[str]) -> List[str]:
     """Find multi-modal NIfTI image paths for a patient."""
-    images_dir = raw_dir / "imagesTr"
     paths = []
     for suf in modality_suffixes:
         p = images_dir / f"{patient_id}{suf}"
@@ -53,8 +67,7 @@ def _find_nifti_paths(raw_dir: Path, patient_id: str, modality_suffixes: List[st
     return paths
 
 
-def _find_mask_path(raw_dir: Path, patient_id: str) -> Optional[str]:
-    labels_dir = raw_dir / "labelsTr"
+def _find_mask_path(labels_dir: Path, patient_id: str) -> Optional[str]:
     for ext in [".nii.gz", ".nii", ".mhd", ".nrrd"]:
         p = labels_dir / f"{patient_id}{ext}"
         if p.exists():
@@ -100,6 +113,9 @@ def main() -> None:
     splits_dir = Path(dcfg["paths"]["splits_dir"])
     modality_suffixes = dcfg["raw_structure"].get("modality_suffixes", ["_0000.nii.gz"])
     out_path = splits_dir / "splits_train5fold_testfixed.jsonl"
+    raw_structure = dcfg.get("raw_structure", {}) or {}
+    images_tr_name = str(raw_structure.get("images_tr_dir", "imagesTr"))
+    labels_tr_name = str(raw_structure.get("labels_tr_dir", "labelsTr"))
 
     # patient_group_regex: optional pattern to extract the "real" patient ID
     # from a case ID that includes a series suffix.
@@ -110,8 +126,8 @@ def main() -> None:
     )
 
     # ── Collect all patients with valid NIfTI files ──
-    images_tr = raw_dir / "imagesTr"
-    labels_tr = raw_dir / "labelsTr"
+    images_tr = _resolve_subdir(raw_dir, images_tr_name, "imagesTr")
+    labels_tr = _resolve_subdir(raw_dir, labels_tr_name, "labelsTr")
 
     if not images_tr.exists():
         raise FileNotFoundError(f"imagesTr not found at {images_tr}")
@@ -121,7 +137,7 @@ def main() -> None:
     patient_ids = []
     for lf in label_files:
         pid = lf.name.replace(".nii.gz", "").replace(".nii", "")
-        img_paths = _find_nifti_paths(raw_dir, pid, modality_suffixes)
+        img_paths = _find_nifti_paths(images_tr, pid, modality_suffixes)
         if img_paths:
             patient_ids.append(pid)
 
@@ -145,8 +161,8 @@ def main() -> None:
             if not splits:
                 missing.append(pid)
                 splits = {"train_fold0"}   # fallback
-            img_paths = _find_nifti_paths(raw_dir, pid, modality_suffixes)
-            mask_path = _find_mask_path(raw_dir, pid)
+            img_paths = _find_nifti_paths(images_tr, pid, modality_suffixes)
+            mask_path = _find_mask_path(labels_tr, pid)
             for spl in sorted(splits):
                 row = {
                     "id":          pid,
@@ -203,8 +219,8 @@ def main() -> None:
 
         rows = []
         for pid in patient_ids:
-            img_paths = _find_nifti_paths(raw_dir, pid, modality_suffixes)
-            mask_path = _find_mask_path(raw_dir, pid)
+            img_paths = _find_nifti_paths(images_tr, pid, modality_suffixes)
+            mask_path = _find_mask_path(labels_tr, pid)
             grp = get_group_id(pid)
 
             if grp in test_groups:

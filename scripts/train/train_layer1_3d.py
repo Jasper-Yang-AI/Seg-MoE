@@ -35,6 +35,7 @@ from seg_moe.training.losses import build_loss_fn, ce_plus_dice
 from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl, save_jsonl
 from seg_moe.utils.seed import seed_everything
+from seg_moe.utils.spatial import parse_3d_size
 
 _IS_WINDOWS = platform.system() == "Windows"
 _DEFAULT_WORKERS = 2 if _IS_WINDOWS else 4
@@ -161,7 +162,7 @@ def train_model_3d(
 
     # Sliding window config
     sw_cfg = training_cfg.get("sliding_window", {}) or {}
-    roi_size = tuple(sw_cfg.get("roi_size", [128, 128, 64]))
+    roi_size = parse_3d_size(sw_cfg.get("roi_size", [128, 128, 64]))
     sw_batch = int(sw_cfg.get("sw_batch_size", 2))
     sw_overlap = float(sw_cfg.get("overlap", 0.5))
 

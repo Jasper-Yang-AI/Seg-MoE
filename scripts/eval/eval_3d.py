@@ -39,6 +39,7 @@ from seg_moe.models.factory_3d import (
 )
 from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl
+from seg_moe.utils.spatial import parse_3d_size
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +204,7 @@ def main() -> None:
     device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     sw_cfg   = dataset_cfg.get("input", {})
-    roi_size = tuple(int(s) for s in sw_cfg.get("roi_size", [128, 128, 64]))
+    roi_size = parse_3d_size(sw_cfg.get("roi_size", [128, 128, 64]))
     sw_batch = 2
 
     # ----- Datasets -----
