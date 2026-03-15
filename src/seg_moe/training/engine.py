@@ -54,6 +54,19 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if isinstance(model, torch.nn.DataParallel) else model
 
 
+def load_checkpoint_file(path: Path) -> Dict[str, Any]:
+    """Load a full training checkpoint across torch versions.
+
+    PyTorch 2.6 changed torch.load default to weights_only=True, which breaks
+    resuming checkpoints that contain optimizer/scheduler/scaler states.
+    """
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        # Backward compatibility for torch versions without weights_only arg.
+        return torch.load(path, map_location="cpu")
+
+
 # ---------------------------------------------------------------------------
 # LR Scheduler helpers
 # ---------------------------------------------------------------------------
@@ -212,7 +225,7 @@ def train_model(
     if resume_from:
         resume_path = Path(resume_from)
         if resume_path.exists():
-            state = torch.load(resume_path, map_location="cpu")
+            state = load_checkpoint_file(resume_path)
             if "model" in state:
                 raw_sd = normalize_state_dict_keys(state["model"])
                 raw_model = unwrap_model(model)

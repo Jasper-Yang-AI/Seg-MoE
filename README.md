@@ -139,7 +139,58 @@ python scripts/eval/export_tables.py --exp configs/2d/exp/exp_prostate_local.yam
 
 ---
 
-## 3. 3D 实验（Prostate / Liver 通用流程）
+## 3. OOF 可复核审计与失败病例早筛（2D）
+
+### 3.1 Layer1 / Layer2 OOF 审计（建议每次生成 OOF 后执行）
+
+```powershell
+# Layer1 OOF 审计
+python scripts/utils/audit_oof_manifest.py `
+  --manifest runs/segmoe_2d_prostate/cache/oof/layer1/oof_manifest.jsonl `
+  --splits data/splits/prostate_local/splits_train5fold_testfixed.jsonl `
+  --out runs/segmoe_2d_prostate/results/oof_audit_layer1.json `
+  --check-ckpt-fold
+
+# Layer2 OOF 审计
+python scripts/utils/audit_oof_manifest.py `
+  --manifest runs/segmoe_2d_prostate/cache/oof/layer2/oof_manifest_layer2.jsonl `
+  --splits data/splits/prostate_local/splits_train5fold_testfixed.jsonl `
+  --out runs/segmoe_2d_prostate/results/oof_audit_layer2.json `
+  --check-ckpt-fold
+```
+
+审计脚本会检查：
+- `sample_fold / predictor_fold / split(val_foldk)` 是否一致
+- `prob_path` 文件是否真实存在
+- manifest 覆盖率是否与 splits 中各 fold 的 `val_foldk` 数量一致
+
+通过标准：`is_strict_oof=True` 且 `errors=[]`。
+
+### 3.2 失败病例早筛（uncertainty / disagreement vs Dice）
+
+```powershell
+# 快速验证（推荐先跑 fold0）
+python scripts/eval/eval_failure_detection_oof.py `
+  --manifest runs/segmoe_2d_prostate/cache/oof/layer1/oof_manifest.jsonl `
+  --splits data/splits/prostate_local/splits_train5fold_testfixed.jsonl `
+  --outdir runs/segmoe_2d_prostate/results/failure_detection_oof_fold0 `
+  --sample-fold 0 --max-samples 2000
+
+# 全量评估（全部 folds）
+python scripts/eval/eval_failure_detection_oof.py `
+  --manifest runs/segmoe_2d_prostate/cache/oof/layer1/oof_manifest.jsonl `
+  --splits data/splits/prostate_local/splits_train5fold_testfixed.jsonl `
+  --outdir runs/segmoe_2d_prostate/results/failure_detection_oof
+```
+
+输出文件：
+- `per_sample_scores.csv`：切片级 uncertainty/disagreement 与 Dice
+- `per_patient_scores.csv`：病例级聚合（更接近临床分诊）
+- `summary.json`：相关性、AUROC、Top-k 风险筛查命中率/召回率
+
+---
+
+## 4. 3D 实验（Prostate / Liver 通用流程）
 
 以下以 **Liver** 配置为例，Prostate 3D 只需替换变量：
 

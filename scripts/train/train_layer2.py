@@ -78,6 +78,12 @@ def _resolve_resume(resume_arg: str, last_ckpt: Path, best_ckpt: Path) -> str | 
     return None
 
 
+def _parse_name_list(raw: str | None) -> set[str]:
+    if not raw:
+        return set()
+    return {x.strip() for x in str(raw).split(",") if x.strip()}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train Layer2 experts with OOF probs")
     ap.add_argument("--exp", required=True)
@@ -95,6 +101,8 @@ def main() -> None:
     ap.add_argument("--no-uncertainty", action="store_true",
                     help="Disable uncertainty channels (entropy + disagreement)")
     ap.add_argument("--gpus", type=str, default=None)
+    ap.add_argument("--skip-experts", type=str, default="",
+                    help="Comma-separated expert names to skip, e.g. nnunet-2d")
     ap.add_argument("--amp", action="store_true", default=None)
     ap.add_argument("--num-workers", type=int, default=None)
     ap.add_argument("--grad-accum", type=int, default=None)
@@ -138,8 +146,15 @@ def main() -> None:
     fold = int(args.fold)
     num_classes = infer_num_classes(dataset_cfg)
     base_in = infer_image_channels(dataset_cfg)
-    expert_cfgs = list_experts(models_cfg)
-    K = len(expert_cfgs)
+    all_expert_cfgs = list_experts(models_cfg)
+    K = len(all_expert_cfgs)
+    skip_expert_names = _parse_name_list(args.skip_experts)
+    expert_cfgs = [ec for ec in all_expert_cfgs if expert_name(ec) not in skip_expert_names]
+
+    if skip_expert_names:
+        print(f"[Layer2] Skip experts: {sorted(skip_expert_names)}")
+    if not expert_cfgs:
+        raise ValueError("No experts left to train after applying --skip-experts")
 
     # ── B5: Uncertainty channels ──
     add_uncertainty = not args.no_uncertainty
