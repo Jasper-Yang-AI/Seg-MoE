@@ -1,23 +1,4 @@
-"""
-Train patch-level gating network for dynamic expert fusion.
-
-核心流程 (Seg-MoE 课题设计):
-  Layer1 train → L1 OOF → Layer2 train → **L2 OOF** → Gating → Eval
-  1. 加载 **Layer2** OOF 概率图 [K, M, H, W] (非 Layer1!)
-  2. 切分为 patches [K*M, pH, pW]
-  3. 门控网络预测 per-patch 专家权重 [K]
-  4. 加权融合: fused = Σ_k w_k · probs_k
-  5. 与 GT mask patch 计算 Dice + CE loss (端到端)
-  6. 可选: 负载平衡正则化 (防止专家坍缩)
-  7. 温度退火: τ 从 2.0 → 0.5 (训练初期均匀探索, 后期锐化)
-
-Usage:
-    python scripts/train/train_gating.py \\
-      --exp configs/2d/exp/exp_msd_task03_liver.yaml \\
-      --gating-config configs/2d/gating.yaml \\
-      --models configs/2d/models.yaml \\
-      --fold 0 --gpus 0,1
-"""
+"""Train patch-level gating network for dynamic expert fusion."""
 from __future__ import annotations
 
 import argparse
@@ -48,10 +29,6 @@ from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl
 from seg_moe.utils.seed import seed_everything
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _load_splits(dataset_cfg: dict) -> list[dict]:
     splits_dir = Path(dataset_cfg["paths"]["splits_dir"])
@@ -88,14 +65,19 @@ def _unwrap(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, nn.DataParallel) else model
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def _move_extra_to_device(extra: dict, device: torch.device) -> dict:
+    if not extra:
+        return {}
+    out = {}
+    for key, value in extra.items():
+        out[key] = value.to(device) if torch.is_tensor(value) else value
+    return out
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train patch-level gating network")
     ap.add_argument("--exp", required=True, help="Experiment config")
-    ap.add_argument("--gating-config", required=True, help="Gating config (configs/2d/gating.yaml)")
+    ap.add_argument("--gating-config", required=True, help="Gating config YAML")
     ap.add_argument("--models", required=True, help="Expert model config")
     ap.add_argument("--fold", type=int, default=0)
     ap.add_argument("--gpus", type=str, default=None)
@@ -104,7 +86,6 @@ def main() -> None:
     ap.add_argument("--skip-if-done", action="store_true")
     args = ap.parse_args()
 
-    # ---- Config loading ----
     exp_cfg = load_config(args.exp)
     gating_cfg_raw = load_config(args.gating_config)
     models_cfg = load_config(args.models)
@@ -113,25 +94,22 @@ def main() -> None:
     gcfg = gating_cfg_raw["gating"]
     tcfg = gating_cfg_raw["training"]
 
-    fold = args.fold
+    fold = int(args.fold)
     seed_everything(args.seed)
-
     device, gpu_ids = _parse_gpu_ids(args.gpus)
 
-    # ---- Dataset params ----
     num_classes = infer_num_classes(dataset_cfg)
+    raw_image_channels = int(dataset_cfg["input"].get("image_channels", 3))
+    image_channels = 3 if raw_image_channels == 1 else raw_image_channels
     expert_cfgs = list_experts(models_cfg)
-    K = len(expert_cfgs)
+    num_experts = len(expert_cfgs)
 
     patch_size = int(gcfg.get("patch_size", 64))
     stride = int(gcfg.get("stride", 32))
     fg_oversample = float(gcfg.get("foreground_oversample_ratio", 0.0))
 
-    # ---- OOF paths (Layer2 OOF, NOT Layer1) ----
-    cache_root = Path(
-        exp_cfg["layering"]["cache_root"].replace("${exp_name}", exp_cfg["exp_name"])
-    )
-    oof_manifest_path = Path(
+    cache_root = Path(exp_cfg["layering"]["cache_root"].replace("${exp_name}", exp_cfg["exp_name"]))
+    l2_oof_manifest_path = Path(
         str(
             exp_cfg.get("layering", {}).get(
                 "l2_oof_manifest_path",
@@ -139,13 +117,21 @@ def main() -> None:
             )
         ).replace("${exp_name}", exp_cfg["exp_name"])
     )
-    if not oof_manifest_path.exists():
+    if not l2_oof_manifest_path.exists():
         raise FileNotFoundError(
-            f"Layer2 OOF manifest not found: {oof_manifest_path}. "
+            f"Layer2 OOF manifest not found: {l2_oof_manifest_path}. "
             "Run scripts/inference/generate_layer2_oof.py first."
         )
 
-    # ---- Run dir ----
+    l1_oof_manifest_path = Path(
+        str(
+            exp_cfg.get("layering", {}).get(
+                "oof_manifest_path",
+                cache_root / "oof" / "layer1" / "oof_manifest.jsonl",
+            )
+        ).replace("${exp_name}", exp_cfg["exp_name"])
+    )
+
     run_dir = Path(resolve_run_dir(exp_cfg))
     ckpt_dir = run_dir / "checkpoints" / "gating" / f"fold{fold}"
     log_dir = run_dir / "logs" / "gating" / f"fold{fold}"
@@ -154,47 +140,84 @@ def main() -> None:
 
     best_ckpt = ckpt_dir / "best.pt"
     last_ckpt = ckpt_dir / "last.pt"
-
     if args.skip_if_done and best_ckpt.exists():
         print(f"Skip: {best_ckpt}")
         return
 
-    # ---- Datasets ----
     rows = _load_splits(dataset_cfg)
     train_rows = [r for r in rows if r.get("split") == f"train_fold{fold}"]
     val_rows = [r for r in rows if r.get("split") == f"val_fold{fold}"]
 
+    use_layer1_semantics = bool(gcfg.get("use_layer1_semantics", False))
+    use_image_context = bool(gcfg.get("use_image_context", False))
+    use_position_channels = bool(gcfg.get("use_position_channels", False))
+    use_slice_position = bool(gcfg.get("use_slice_position", False))
+
     train_ds = GatingPatchDataset(
-        train_rows, dataset_cfg, oof_manifest_path,
-        expected_num_experts=K, patch_size=patch_size, stride=stride,
-        is_train=True, foreground_oversample_ratio=fg_oversample,
+        train_rows,
+        dataset_cfg,
+        l2_oof_manifest_path,
+        expected_num_experts=num_experts,
+        patch_size=patch_size,
+        stride=stride,
+        is_train=True,
+        foreground_oversample_ratio=fg_oversample,
+        layer1_oof_manifest_path=l1_oof_manifest_path,
+        use_layer1_semantics=use_layer1_semantics,
+        use_image_context=use_image_context,
+        use_position_channels=use_position_channels,
+        use_slice_position=use_slice_position,
     )
     val_ds = GatingPatchDataset(
-        val_rows, dataset_cfg, oof_manifest_path,
-        expected_num_experts=K, patch_size=patch_size, stride=stride,
+        val_rows,
+        dataset_cfg,
+        l2_oof_manifest_path,
+        expected_num_experts=num_experts,
+        patch_size=patch_size,
+        stride=stride,
         is_train=False,
+        layer1_oof_manifest_path=l1_oof_manifest_path,
+        use_layer1_semantics=use_layer1_semantics,
+        use_image_context=use_image_context,
+        use_position_channels=use_position_channels,
+        use_slice_position=use_slice_position,
     )
 
-    print(f"Gating | K={K} M={num_classes} patch={patch_size} stride={stride} fg_oversample={fg_oversample}")
+    print(
+        f"Gating | K={num_experts} M={num_classes} patch={patch_size} stride={stride} "
+        f"fg_oversample={fg_oversample}"
+    )
     print(f"Train patches: {len(train_ds)}, Val patches: {len(val_ds)}")
 
-    bs = int(tcfg.get("batch_size", 512))
-    nw = int(tcfg.get("dataloader", {}).get("num_workers", 4))
-    pm = bool(tcfg.get("dataloader", {}).get("pin_memory", True))
+    batch_size = int(tcfg.get("batch_size", 512))
+    num_workers = int(tcfg.get("dataloader", {}).get("num_workers", 4))
+    pin_memory = bool(tcfg.get("dataloader", {}).get("pin_memory", True))
 
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,
-                              num_workers=nw, pin_memory=pm, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False,
-                            num_workers=nw, pin_memory=pm)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
 
-    # ---- Build gating model ----
     gate_cfg = PatchGatingConfig(
-        num_experts=K,
+        num_experts=num_experts,
         num_classes=num_classes,
+        image_channels=image_channels,
         patch_size=patch_size,
         stride=stride,
         hidden_dim=int(gcfg.get("hidden_dim", 64)),
         score_hidden_dim=int(gcfg.get("score_hidden_dim", gcfg.get("hidden_dim", 64))),
+        context_hidden_dim=int(gcfg.get("context_hidden_dim", 32)),
         dropout=float(gcfg.get("dropout", 0.1)),
         per_class=bool(gcfg.get("per_class", False)),
         use_residual_head=bool(gcfg.get("use_residual_head", True)),
@@ -202,43 +225,44 @@ def main() -> None:
         use_consensus_features=bool(gcfg.get("use_consensus_features", True)),
         use_disagreement_features=bool(gcfg.get("use_disagreement_features", True)),
         use_confidence_features=bool(gcfg.get("use_confidence_features", True)),
+        use_prior_agreement_features=bool(gcfg.get("use_prior_agreement_features", False)),
+        use_layer1_semantics=use_layer1_semantics,
+        use_image_context=use_image_context,
+        use_position_channels=use_position_channels,
+        use_slice_position=use_slice_position,
+        use_context_film=bool(gcfg.get("use_context_film", True)),
         temperature_start=float(gcfg.get("temperature_start", 2.0)),
         temperature_end=float(gcfg.get("temperature_end", 0.5)),
         load_balance_weight=float(gcfg.get("load_balance_weight", 0.01)),
         spatial_smooth_weight=float(gcfg.get("spatial_smooth_weight", 0.0)),
         blend_mode=str(gcfg.get("blend_mode", "gaussian")),
     )
+
     model = PatchConvGate2D(gate_cfg)
-    n_params = sum(p.numel() for p in model.parameters()) / 1e3
-    print(f"Gating network: {n_params:.1f}K params")
+    print(f"Gating network: {sum(p.numel() for p in model.parameters()) / 1e3:.1f}K params")
     model.to(device)
     model = _wrap_dp(model, gpu_ids)
 
-    # ---- Loss ----
-    loss_cfg = tcfg.get("loss", {})
-    seg_loss_fn = build_loss_fn(loss_cfg, num_classes)
+    seg_loss_fn = build_loss_fn(tcfg.get("loss", {}), num_classes)
     lb_weight = gate_cfg.load_balance_weight
     tv_weight = gate_cfg.spatial_smooth_weight
 
-    # ---- Optimizer ----
     lr = float(tcfg.get("lr", 1e-3))
     opt_cfg = tcfg.get("optimizer", {}) or {}
     opt_name = str(opt_cfg.get("name", "adamw")).lower()
-    wd = float(opt_cfg.get("weight_decay", 0.01))
+    weight_decay = float(opt_cfg.get("weight_decay", 0.01))
     if opt_name == "adamw":
-        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     elif opt_name == "sgd":
-        mom = float(opt_cfg.get("momentum", 0.9))
-        opt = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=wd, momentum=mom)
+        momentum = float(opt_cfg.get("momentum", 0.9))
+        opt = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay, momentum=momentum)
     else:
-        opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+        opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # ---- Scheduler ----
     epochs = int(tcfg.get("epochs", 50))
-    sched_cfg = tcfg.get("scheduler", {}) or {}
-    sched_name = str(sched_cfg.get("name", "cosine")).lower()
     scheduler = None
-    if sched_name == "cosine":
+    sched_cfg = tcfg.get("scheduler", {}) or {}
+    if str(sched_cfg.get("name", "cosine")).lower() == "cosine":
         warmup_epochs = int(sched_cfg.get("warmup_epochs", 5))
         min_lr_ratio = float(sched_cfg.get("min_lr", 1e-6)) / max(lr, 1e-12)
         scheduler = get_cosine_schedule_with_warmup(
@@ -248,7 +272,6 @@ def main() -> None:
             min_lr_ratio,
         )
 
-    # ---- AMP ----
     amp_cfg = tcfg.get("amp", {}) or {}
     amp_enabled = bool(amp_cfg.get("enabled", False)) and device.type == "cuda"
     amp_dtype_name = str(amp_cfg.get("dtype", "float16")).lower()
@@ -256,7 +279,6 @@ def main() -> None:
     use_scaler = amp_enabled and (amp_dtype == torch.float16)
     scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
-    # ---- Resume ----
     start_epoch = 1
     best_metric = -1.0
     if args.resume and Path(args.resume).exists():
@@ -270,51 +292,42 @@ def main() -> None:
             best_metric = float(state["best_metric"])
         print(f"Resumed from {args.resume}, epoch {start_epoch}")
 
-    # ---- Logging ----
     writer = SummaryWriter(log_dir=str(log_dir))
     flog = logging.getLogger(f"gating_fold{fold}")
     flog.addHandler(logging.FileHandler(log_dir / "train.log"))
     flog.setLevel(logging.INFO)
 
-    t_start = gate_cfg.temperature_start
-    t_end = gate_cfg.temperature_end
+    print(f"Training gating: fold={fold} device={device} epochs={epochs} bs={batch_size} lr={lr}")
+    flog.info(f"Training gating: fold={fold} K={num_experts} M={num_classes} patch={patch_size}")
 
-    print(f"Training gating: fold={fold} device={device} epochs={epochs} bs={bs} lr={lr}")
-    flog.info(f"Training gating: fold={fold} K={K} M={num_classes} patch={patch_size} domain=logits")
-
-    # ================================================================
-    # Training loop
-    # ================================================================
     for epoch in range(start_epoch, epochs + 1):
         epoch_t0 = time.time()
-        τ = compute_temperature(epoch - 1, epochs, t_start, t_end)
+        tau = compute_temperature(epoch - 1, epochs, gate_cfg.temperature_start, gate_cfg.temperature_end)
 
-        # ---- Train ----
         model.train()
         running_loss = 0.0
         running_lb = 0.0
         n_steps = 0
 
         pbar = tqdm(train_loader, desc=f"gating e{epoch}/{epochs}")
-        for logits_cache, mask, sample_ids, positions in pbar:
-            logits_cache = logits_cache.to(device)       # [B, K, M, pH, pW]
-            mask = mask.to(device)                       # [B, pH, pW]
+        for logits_cache, mask, sample_ids, positions, extra in pbar:
+            logits_cache = logits_cache.to(device)
+            mask = mask.to(device)
             sample_ids = sample_ids.to(device)
             positions = positions.to(device)
+            extra = _move_extra_to_device(extra, device)
 
             with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
-                weights = model(logits_cache, temperature=τ)  # [B, K] or [B, K, M]
-                fused = _unwrap(model).fuse_logits(logits_cache, weights)  # [B, M, pH, pW]
-
+                weights = model(logits_cache, extra=extra, temperature=tau)
+                fused = _unwrap(model).fuse_logits(logits_cache, weights)
                 seg_loss = seg_loss_fn(fused, mask)
 
-                w_per_expert = _unwrap(model).weights_per_expert(weights)  # [B, K]
+                w_per_expert = _unwrap(model).weights_per_expert(weights)
                 lb_loss = compute_load_balance_loss(w_per_expert)
                 tv_loss = (
                     compute_spatial_smooth_loss(w_per_expert, sample_ids=sample_ids, positions=positions)
                     if tv_weight > 0 else w_per_expert.new_tensor(0.0)
                 )
-
                 loss = seg_loss + lb_weight * lb_loss + tv_weight * tv_loss
 
             if not torch.isfinite(loss):
@@ -336,33 +349,31 @@ def main() -> None:
             running_loss += float(seg_loss.item())
             running_lb += float(lb_loss.item())
             n_steps += 1
-            pbar.set_postfix(loss=running_loss / max(1, n_steps), τ=f"{τ:.2f}")
+            pbar.set_postfix(loss=running_loss / max(1, n_steps), tau=f"{tau:.2f}")
 
         train_loss = running_loss / max(1, n_steps)
         train_lb = running_lb / max(1, n_steps)
 
-        # ---- Validation ----
         model.eval()
-        val_losses = []
+        val_losses: list[float] = []
         val_dices: list[float] = []
 
         with torch.no_grad():
-            for logits_cache, mask, sample_ids, positions in tqdm(val_loader, desc=f"val e{epoch}"):
+            for logits_cache, mask, sample_ids, positions, extra in tqdm(val_loader, desc=f"val e{epoch}"):
                 logits_cache = logits_cache.to(device)
                 mask = mask.to(device)
+                extra = _move_extra_to_device(extra, device)
 
                 with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
-                    weights = model(logits_cache, temperature=τ)
+                    weights = model(logits_cache, extra=extra, temperature=tau)
                     fused = _unwrap(model).fuse_logits(logits_cache, weights)
                     loss = seg_loss_fn(fused, mask)
 
                 val_losses.append(float(loss.item()))
-
-                # Per-patch Dice
-                pred = fused.argmax(dim=1)  # [B, pH, pW]
-                for c in range(1, num_classes):  # skip background
-                    p = (pred == c).float()
-                    g = (mask == c).float()
+                pred = fused.argmax(dim=1)
+                for cls in range(1, num_classes):
+                    p = (pred == cls).float()
+                    g = (mask == cls).float()
                     inter = (p * g).sum()
                     union = p.sum() + g.sum()
                     if union > 0:
@@ -375,19 +386,18 @@ def main() -> None:
         writer.add_scalar("loss/val", val_loss, epoch)
         writer.add_scalar("loss/load_balance", train_lb, epoch)
         writer.add_scalar("metrics/val_dice", val_dice, epoch)
-        writer.add_scalar("temperature", τ, epoch)
+        writer.add_scalar("temperature", tau, epoch)
         writer.add_scalar("lr", opt.param_groups[0]["lr"], epoch)
 
         elapsed = time.time() - epoch_t0
         log_line = (
-            f"epoch={epoch}/{epochs} τ={τ:.2f} train_loss={train_loss:.4f} "
+            f"epoch={epoch}/{epochs} tau={tau:.2f} train_loss={train_loss:.4f} "
             f"lb_loss={train_lb:.4f} val_loss={val_loss:.4f} val_dice={val_dice:.4f} "
             f"lr={opt.param_groups[0]['lr']:.2e} time={elapsed:.0f}s"
         )
         print(log_line)
         flog.info(log_line)
 
-        # ---- Checkpoint ----
         raw_model = _unwrap(model)
         ckpt = {
             "model": raw_model.state_dict(),
@@ -395,12 +405,16 @@ def main() -> None:
             "epoch": epoch,
             "best_metric": best_metric,
             "val_dice": val_dice,
-            "temperature": τ,
+            "temperature": tau,
             "gate_cfg": {
-                "num_experts": K, "num_classes": num_classes,
-                "patch_size": patch_size, "stride": stride,
+                "num_experts": gate_cfg.num_experts,
+                "num_classes": gate_cfg.num_classes,
+                "image_channels": gate_cfg.image_channels,
+                "patch_size": gate_cfg.patch_size,
+                "stride": gate_cfg.stride,
                 "hidden_dim": gate_cfg.hidden_dim,
                 "score_hidden_dim": gate_cfg.score_hidden_dim,
+                "context_hidden_dim": gate_cfg.context_hidden_dim,
                 "dropout": gate_cfg.dropout,
                 "per_class": gate_cfg.per_class,
                 "use_residual_head": gate_cfg.use_residual_head,
@@ -408,6 +422,12 @@ def main() -> None:
                 "use_consensus_features": gate_cfg.use_consensus_features,
                 "use_disagreement_features": gate_cfg.use_disagreement_features,
                 "use_confidence_features": gate_cfg.use_confidence_features,
+                "use_prior_agreement_features": gate_cfg.use_prior_agreement_features,
+                "use_layer1_semantics": gate_cfg.use_layer1_semantics,
+                "use_image_context": gate_cfg.use_image_context,
+                "use_position_channels": gate_cfg.use_position_channels,
+                "use_slice_position": gate_cfg.use_slice_position,
+                "use_context_film": gate_cfg.use_context_film,
                 "blend_mode": gate_cfg.blend_mode,
             },
         }
@@ -417,7 +437,7 @@ def main() -> None:
             best_metric = val_dice
             ckpt["best_metric"] = best_metric
             torch.save(ckpt, best_ckpt)
-            print(f"  ★ New best: val_dice={val_dice:.4f}")
+            print(f"  New best: val_dice={val_dice:.4f}")
 
     writer.close()
     print(f"Gating training done. Best val_dice={best_metric:.4f}")

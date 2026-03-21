@@ -1,50 +1,46 @@
-#  Patch-Level 门控网络配置 
-# Seg-MoE 课题核心: Layer2 logits  Patch  Gating Network  动态融合
+# Unified 2D patch-level gating configuration
 #
-# 正确流程: Layer1  L1 OOF  Layer2  L2 OOF (含 logits)  Gating  Eval
-# 门控网络输入 = Layer2 专家的 OOF logits [K, M, H, W]
-# 融合: fused_logits = Σ_k w_k * logits_k   CE + Dice loss (语义正确)
-#
-# 参考:
-#   - Shazeer et al. 2017 "Outrageously Large Neural Networks" (MoE gating)
-#   - Riquelme et al. 2021 "Scaling Vision with Sparse MoE" (V-MoE)
-#
-# 双卡 RTX 5090 最优配置 (DataParallel, 无 DDP)
+# Core idea:
+# - High-order semantics from Layer2 expert logits
+# - Low-order semantic prior from Layer1 OOF mean/entropy/disagreement
+# - Context-aware routing from image appearance + spatial coordinates + slice position
+# - Class-aware dynamic fusion with expert relation modeling
 
 gating:
-  #  网络架构 
-  hidden_dim: 64              # Conv 通道数 (~30-50K params total, K*M 输入通道)
-  score_hidden_dim: 64        # 专家打分 MLP 隐层
+  hidden_dim: 64
+  score_hidden_dim: 64
+  context_hidden_dim: 32
   dropout: 0.1
-  per_class: false            # true = [K,M] per-class per-expert; false = [K] per-expert
-  use_residual_head: true     # 残差 FC shortcut, 改善梯度流
-  use_entropy: true           # 从 logits 在线计算 entropy 作为置信度信号
+
+  per_class: true
+  use_residual_head: true
+  use_entropy: true
   use_consensus_features: true
   use_disagreement_features: true
   use_confidence_features: true
+  use_prior_agreement_features: true
 
-  #  Patch 参数 (256256 图像) 
-  patch_size: 64              # 每 patch 6464
-  stride: 32                  # 50% 重叠  77 = 49 patches/image
-  blend_mode: "gaussian"      # 合并模式: "gaussian" (推荐) / "average"
+  use_layer1_semantics: true
+  use_image_context: true
+  use_position_channels: true
+  use_slice_position: true
+  use_context_film: true
 
-  #  温度退火 (softmax temperature) 
-  temperature_start: 2.0      # 初期: 均匀探索, 让所有专家贡献
-  temperature_end: 0.5        # 后期: 锐化选择, 突出最优专家
+  patch_size: 64
+  stride: 32
+  blend_mode: "gaussian"
 
-  #  负载平衡正则化 
-  load_balance_weight: 0.01   # λ_lb, 防止一个专家主导所有 patch (Shazeer 2017)
+  temperature_start: 2.0
+  temperature_end: 0.6
 
-  #  空间一致性正则化 (TV-norm on weight map) 
-  spatial_smooth_weight: 0.001  # λ_tv; 0 = 关闭; 推荐 1e-3 ~ 1e-2
-
-  #  前景过采样 
-  foreground_oversample_ratio: 0.5   # 0 = 关闭; 推荐 0.3-0.7 for small lesions
+  load_balance_weight: 0.01
+  spatial_smooth_weight: 0.002
+  foreground_oversample_ratio: 0.5
 
 training:
-  batch_size: 512             # patch 级别 batch (512 patches  72MB 输入)
-  epochs: 50
-  lr: 1.0e-3
+  batch_size: 256
+  epochs: 60
+  lr: 8.0e-4
 
   optimizer:
     name: "adamw"
@@ -57,10 +53,10 @@ training:
 
   amp:
     enabled: true
-    dtype: "bfloat16"         # 5090 Blackwell 原生支持
+    dtype: "bfloat16"
 
   loss:
-    name: "ce_plus_dice"      # fused_logits vs GT 端到端监督
+    name: "ce_plus_dice"
     dice_smooth: 1.0
     ce_weight: 1.0
     dice_weight: 1.0
