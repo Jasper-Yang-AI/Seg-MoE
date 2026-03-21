@@ -15,6 +15,7 @@ Design decisions (Windows DataParallel, no DDP):
 from __future__ import annotations
 
 import logging
+import math
 import platform
 import time
 from dataclasses import dataclass
@@ -196,6 +197,10 @@ def train_model(
         num_warmup_steps = warmup_epochs * len(train_loader)
         num_training_steps = epochs * len(train_loader)
         scheduler = get_cosine_schedule_with_warmup(opt, num_warmup_steps, num_training_steps, min_lr_ratio)
+    elif sched_name == "poly":
+        poly_power = float(sched_cfg.get("poly_power", sched_cfg.get("power", 0.9)))
+        total_iters = max(epochs * math.ceil(len(train_loader) / max(grad_accum_steps, 1)), 1)
+        scheduler = torch.optim.lr_scheduler.PolynomialLR(opt, total_iters=total_iters, power=poly_power)
     elif sched_name == "step":
         step_size = int(sched_cfg.get("step_size", 30))
         gamma = float(sched_cfg.get("gamma", 0.1))
@@ -300,6 +305,7 @@ def train_model(
         model.train()
         running_loss = 0.0
         n_steps = 0
+        pending_grads = False
 
         pbar = tqdm(train_loader, desc=f"train[{tag}] e{epoch}/{epochs}")
         for batch_idx, batch in enumerate(pbar):
@@ -322,6 +328,7 @@ def train_model(
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
+            pending_grads = True
 
             # 梯度累积: 每 grad_accum_steps 步才更新
             if (batch_idx + 1) % grad_accum_steps == 0:
@@ -331,8 +338,9 @@ def train_model(
                 else:
                     opt.step()
                 opt.zero_grad(set_to_none=True)
-                # Cosine scheduler: step-level
-                if scheduler is not None and sched_name == "cosine":
+                pending_grads = False
+                # Step-level schedulers
+                if scheduler is not None and sched_name in {"cosine", "poly"}:
                     scheduler.step()
                 global_step += 1
 
@@ -340,10 +348,21 @@ def train_model(
             n_steps += 1
             pbar.set_postfix(loss=running_loss / max(1, n_steps), lr=f"{opt.param_groups[0]['lr']:.2e}")
 
+        if pending_grads:
+            if use_scaler:
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
+            opt.zero_grad(set_to_none=True)
+            if scheduler is not None and sched_name in {"cosine", "poly"}:
+                scheduler.step()
+            global_step += 1
+
         train_loss = running_loss / max(1, n_steps)
 
         # Epoch-level scheduler (StepLR etc.)
-        if scheduler is not None and sched_name != "cosine":
+        if scheduler is not None and sched_name not in {"cosine", "poly"}:
             scheduler.step()
 
         writer.add_scalar("loss/train", train_loss, epoch)

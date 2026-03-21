@@ -35,7 +35,6 @@ from seg_moe.models.factory_3d import (
     build_expert_3d,
     expert_name_3d,
     list_experts_3d,
-    transfer_layer1_to_layer2_3d,
 )
 from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl
@@ -66,60 +65,57 @@ def _sliding_window(model, x, roi_size, sw_batch, overlap, device):
         return model(x)
 
 
-def _load_l2_model(ec, run_dir, fold, in_ch, num_classes, in_ch_l1, which, device):
+def _load_l2_model(ec, run_dir, fold, in_ch, num_classes, which, device):
     name  = expert_name_3d(ec)
     l2_ck = _ckpt(run_dir, "layer2", fold, name, which)
-    l1_ck = _ckpt(run_dir, "layer1", fold, name, which)
-    if l2_ck.exists():
-        m = build_expert_3d(ec, in_channels=in_ch, num_classes=num_classes)
-        st = torch.load(l2_ck, map_location="cpu", weights_only=True)
-        m.load_state_dict({k.removeprefix("module."): v for k, v in st["model"].items()},
-                          strict=False)
-    elif l1_ck.exists():
-        m_l1 = build_expert_3d(ec, in_channels=in_ch_l1, num_classes=num_classes)
-        st = torch.load(l1_ck, map_location="cpu", weights_only=True)
-        m_l1.load_state_dict({k.removeprefix("module."): v for k, v in st["model"].items()},
-                             strict=False)
-        m = build_expert_3d(ec, in_channels=in_ch, num_classes=num_classes)
-        transfer_layer1_to_layer2_3d(
-            m_l1, m,
-            base_in_channels=in_ch_l1,
-            extra_in_channels=in_ch - in_ch_l1,
+    if not l2_ck.exists():
+        raise FileNotFoundError(
+            f"Layer2 checkpoint not found for {name} fold{fold}: {l2_ck}. "
+            "Run scripts/train/train_layer2_3d.py before eval_3d.py."
         )
-    else:
-        raise FileNotFoundError(f"No ckpt for {name} fold{fold}")
+    m = build_expert_3d(ec, in_channels=in_ch, num_classes=num_classes)
+    st = torch.load(l2_ck, map_location="cpu", weights_only=True)
+    m.load_state_dict({k.removeprefix("module."): v for k, v in st["model"].items()},
+                      strict=False)
     return m.eval().to(device)
 
 
 def _load_gating_model(run_dir, fold, gate_cfg, expert_cfgs, num_classes, device):
     K = len(expert_cfgs)
     M = num_classes
-    ps = tuple(int(x) for x in gate_cfg["gating"]["patch_size"])
     g = gate_cfg["gating"]
+    ckpt_path = run_dir / "checkpoints" / "gating" / f"fold{fold}" / "best.pt"
+    if not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"Gating checkpoint not found at {ckpt_path}. "
+            "Train gating first or pass --no-gating."
+        )
+
+    st = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    gc = st.get("gate_cfg", {})
     model_cfg = PatchGatingConfig3D(
         num_experts=K,
         num_classes=M,
-        patch_size=ps,
-        stride=tuple(int(x) for x in g.get("stride", [16, 16, 8])),
-        hidden_dim=int(g.get("hidden_dim", 64)),
-        dropout=float(g.get("dropout", 0.1)),
-        per_class=bool(g.get("per_class", False)),
-        use_residual_head=bool(g.get("use_residual_head", True)),
-        temperature_start=float(g.get("temperature_start", 2.0)),
-        temperature_end=float(g.get("temperature_end", 0.5)),
+        patch_size=tuple(int(x) for x in gc.get("patch_size", g["patch_size"])),
+        stride=tuple(int(x) for x in gc.get("stride", g.get("stride", [16, 16, 8]))),
+        hidden_dim=int(gc.get("hidden_dim", g.get("hidden_dim", 64))),
+        score_hidden_dim=int(gc.get("score_hidden_dim", g.get("score_hidden_dim", g.get("hidden_dim", 64)))),
+        dropout=float(gc.get("dropout", g.get("dropout", 0.1))),
+        per_class=bool(gc.get("per_class", g.get("per_class", False))),
+        use_residual_head=bool(gc.get("use_residual_head", g.get("use_residual_head", True))),
+        use_entropy=bool(gc.get("use_entropy", g.get("use_entropy", True))),
+        use_consensus_features=bool(gc.get("use_consensus_features", g.get("use_consensus_features", True))),
+        use_disagreement_features=bool(gc.get("use_disagreement_features", g.get("use_disagreement_features", True))),
+        use_confidence_features=bool(gc.get("use_confidence_features", g.get("use_confidence_features", True))),
+        temperature_start=float(st.get("temperature", g.get("temperature_start", 2.0))),
+        temperature_end=float(gc.get("temperature_end", g.get("temperature_end", 0.5))),
         load_balance_weight=float(g.get("load_balance_weight", 0.01)),
         spatial_smooth_weight=float(g.get("spatial_smooth_weight", 0.0)),
-        blend_mode=str(g.get("blend_mode", "gaussian")),
+        blend_mode=str(gc.get("blend_mode", g.get("blend_mode", "gaussian"))),
     )
     model = PatchConvGate3D(model_cfg).to(device)
-    ckpt_path = run_dir / "checkpoints" / "gating" / f"fold{fold}" / "best.pt"
-    if ckpt_path.exists():
-        st = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        model.load_state_dict({k.removeprefix("module."): v for k, v in st["model"].items()},
-                              strict=False)
-        print(f"  Loaded gating from {ckpt_path}")
-    else:
-        print(f"  WARNING: Gating checkpoint not found at {ckpt_path}. Using random weights.")
+    model.load_state_dict({k.removeprefix("module."): v for k, v in st["model"].items()}, strict=True)
+    print(f"  Loaded gating from {ckpt_path}")
     return model.eval()
 
 
@@ -175,6 +171,8 @@ def main() -> None:
                     help="Also evaluate each expert individually")
     ap.add_argument("--no-gating",     action="store_true",
                     help="Skip gating evaluation (e.g. gating not yet trained)")
+    ap.add_argument("--no-uncertainty", action="store_true",
+                    help="Disable uncertainty channels when rebuilding Layer2 inputs")
     args = ap.parse_args()
 
     exp_cfg     = load_config(args.exp)
@@ -197,7 +195,6 @@ def main() -> None:
     print(f"\n[eval_3d] Test volumes: {len(test_rows)}")
 
     num_classes = int(dataset_cfg["task"]["num_classes"])
-    in_ch_l1    = int(dataset_cfg["input"].get("image_channels", 1))
     expert_cfgs = list_experts_3d(models_cfg)
     K           = len(expert_cfgs)
     M           = num_classes
@@ -214,6 +211,8 @@ def main() -> None:
         dataset_cfg=dataset_cfg,
         oof_manifest_path=str(l1_manifest_p),
         is_train=False,
+        expected_num_experts=K,
+        add_uncertainty=not args.no_uncertainty,
     )
     in_ch_l2 = test_ds_l2.in_channels
 
@@ -223,7 +222,7 @@ def main() -> None:
     print(f"\n[eval_3d] Loading Layer2 models (fold={fold}) ...")
     l2_models: List[torch.nn.Module] = []
     for ec in expert_cfgs:
-        m = _load_l2_model(ec, run_dir, fold, in_ch_l2, num_classes, in_ch_l1, args.which, device)
+        m = _load_l2_model(ec, run_dir, fold, in_ch_l2, num_classes, args.which, device)
         l2_models.append(m)
         print(f"  {expert_name_3d(ec)} loaded")
 
@@ -231,8 +230,8 @@ def main() -> None:
     gate_model: Optional[PatchConvGate3D] = None
     if not args.no_gating:
         gate_model = _load_gating_model(run_dir, fold, gate_cfg, expert_cfgs, num_classes, device)
-        ps = tuple(int(x) for x in gate_cfg["gating"]["patch_size"])
-        st = tuple(int(x) for x in gate_cfg["gating"]["stride"])
+        ps = tuple(int(x) for x in gate_model.cfg.patch_size)
+        st = tuple(int(x) for x in gate_model.cfg.stride)
 
     # ----- Evaluation loop -----
     class_names = dataset_cfg["task"].get("class_names", [f"cls_{c}" for c in range(1, M)])
@@ -253,13 +252,16 @@ def main() -> None:
         img_t = img_t.unsqueeze(0).to(device)      # [1, C2, D, H, W]
         mask_np = mask_t.numpy().astype(np.int64)  # [D, H, W]
 
-        # Collect L2 per-expert probs
+        # Collect L2 per-expert outputs
+        expert_logits: List[np.ndarray] = []
         expert_probs: List[np.ndarray] = []
         for ei, m in enumerate(l2_models):
             with torch.no_grad():
                 with torch.amp.autocast("cuda", enabled=device.type == "cuda", dtype=torch.bfloat16):
                     raw = _sliding_window(m, img_t, roi_size, sw_batch, 0.5, device)
-            probs = torch.softmax(raw.squeeze(0), dim=0).float().cpu().numpy()
+            raw_np = raw.squeeze(0).float().cpu().numpy()
+            probs = torch.from_numpy(raw_np).softmax(dim=0).cpu().numpy()
+            expert_logits.append(raw_np)
             expert_probs.append(probs)
 
         # ---- Mean ensemble ----
@@ -272,10 +274,7 @@ def main() -> None:
 
         # ---- Gating ----
         if gate_model is not None:
-            logits_stack = np.stack(
-                [np.log(p.clip(1e-7) / p.clip(1e-7).sum(axis=0, keepdims=True).clip(1e-7))
-                 for p in expert_probs], axis=0
-            )  # [K, M, D, H, W]
+            logits_stack = np.stack(expert_logits, axis=0)  # [K, M, D, H, W]
             fused_logits = fuse_volume_sliding_window(
                 gate_model,
                 torch.from_numpy(logits_stack),

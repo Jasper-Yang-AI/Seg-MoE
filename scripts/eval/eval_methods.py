@@ -377,6 +377,10 @@ def main() -> None:
     ap.add_argument("--gpus", type=str, default=None)
     ap.add_argument("--skip-live-inference", action="store_true",
                     help="Skip live model inference (only use cached OOF probs)")
+    ap.add_argument("--no-uncertainty", action="store_true",
+                    help="Evaluate Layer2 models without uncertainty channels")
+    ap.add_argument("--allow-missing-gating-cache", action="store_true",
+                    help="Do not fail when a trained gating checkpoint exists but metrics cache is missing")
     args = ap.parse_args()
 
     exp_cfg = load_config(args.exp)
@@ -404,6 +408,7 @@ def main() -> None:
     expert_cfgs = list_experts(models_cfg)
     all_expert_names = [expert_name(ec) for ec in expert_cfgs]
     K = len(expert_cfgs)
+    add_uncertainty = not args.no_uncertainty
 
     # Device
     if args.gpus:
@@ -456,13 +461,13 @@ def main() -> None:
         try:
             from seg_moe.data.layer2_oof_dataset import Layer2OOFDataset
 
-            extra_uncertainty_ch = 1 + num_classes  # entropy + disagreement
+            extra_uncertainty_ch = (1 + num_classes) if add_uncertainty else 0
             l2_in_channels = in_channels + K * num_classes + extra_uncertainty_ch
 
             l2_ds = Layer2OOFDataset(
                 eval_rows, dataset_cfg, l1_manifest,
                 expected_num_experts=K, augs_cfg=None, is_train=False,
-                add_uncertainty=True,
+                add_uncertainty=add_uncertainty,
             )
             l2_dl = DataLoader(l2_ds, batch_size=1, shuffle=False)
 
@@ -601,6 +606,13 @@ def main() -> None:
         summary_records.append(agg)
         print(f"  gating: Dice={gating_mean_dice:.4f}")
     else:
+        gating_ckpt = run_dir / "checkpoints" / "gating" / f"fold{fold}" / "best.pt"
+        if gating_ckpt.exists() and not args.allow_missing_gating_cache:
+            raise FileNotFoundError(
+                "Gating checkpoint exists but cached inference results are missing. "
+                "Run scripts/inference/gating_inference.py before eval_methods.py, "
+                "or pass --allow-missing-gating-cache to skip gating."
+            )
         print("\n[Phase D skipped: no gating results cached]")
 
     # ── Phase E: Statistical significance ──────────────────────────

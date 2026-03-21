@@ -17,6 +17,27 @@ def imagenet_normalize(image: np.ndarray) -> np.ndarray:
     return img
 
 
+def normalize_image(
+    image: np.ndarray,
+    normalize_cfg: Optional[Dict[str, Any]] = None,
+) -> np.ndarray:
+    mode = str((normalize_cfg or {}).get("mode", "imagenet")).lower()
+    img = image.astype(np.float32)
+
+    if mode == "imagenet":
+        return imagenet_normalize(img)
+
+    if mode in {"zero_one", "0_1", "01"}:
+        return img / 255.0
+
+    if mode in {"none", "identity"}:
+        if img.max() > 1.0:
+            img = img / 255.0
+        return img
+
+    raise ValueError(f"Unsupported 2D normalize.mode='{mode}'")
+
+
 def build_albu(augs_cfg: Dict[str, Any], is_train: bool) -> Optional[Any]:
     import albumentations as A
 

@@ -331,15 +331,20 @@ def main() -> None:
         ckpt = {
             "model": raw_m.state_dict(), "opt": optimizer.state_dict(),
             "epoch": epoch, "best_metric": best_metric, "val_dice": val_dice,
+            "temperature": tau,
             "gate_cfg": {"num_experts": K, "num_classes": num_classes,
                          "patch_size": patch_size, "stride": stride,
                          "hidden_dim": gate_cfg.hidden_dim,
                          "score_hidden_dim": gate_cfg.score_hidden_dim,
+                         "dropout": gate_cfg.dropout,
+                         "use_residual_head": gate_cfg.use_residual_head,
                          "use_entropy": gate_cfg.use_entropy,
                          "use_consensus_features": gate_cfg.use_consensus_features,
                          "use_disagreement_features": gate_cfg.use_disagreement_features,
                          "use_confidence_features": gate_cfg.use_confidence_features,
-                         "per_class": gate_cfg.per_class},
+                         "per_class": gate_cfg.per_class,
+                         "blend_mode": gate_cfg.blend_mode,
+                         "temperature_end": gate_cfg.temperature_end},
         }
         torch.save(ckpt, last_ckpt)
         if val_dice > best_metric:

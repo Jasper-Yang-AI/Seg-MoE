@@ -23,7 +23,7 @@ pip install "nnunetv2>=2.2"
 |--------|------|------|------|-----------|---------|---------|
 | Prostate（本地） | 2D PNG | 4 (bg/PZ/TZ/lesion) | 3 | `configs/2d/datasets/prostate_local.yaml` | `configs/2d/exp/exp_prostate_local.yaml` | `configs/2d/models.yaml` |
 | Prostate（本地） | 3D NIfTI | 4 | 3 | `configs/3d/datasets/prostate_local_3d.yaml` | `configs/3d/exp/exp_prostate_local_3d.yaml` | `configs/3d/models_3d.yaml` |
-| Liver（Dataset003） | 3D NIfTI | 2 (bg/tumor) | 1 | `configs/3d/datasets/liver_3d.yaml` | `configs/3d/exp/exp_liver_3d.yaml` | `configs/3d/models_3d_liver.yaml` |
+| Liver（Dataset003） | 3D NIfTI | 2 (bg/tumor) | 1 | `configs/3d/datasets/liver_3d.yaml` | `configs/3d/exp/exp_liver_3d.yaml` | `configs/3d/models_3d.yaml` |
 
 **nnUNet 环境变量**（每个新终端执行一次）：
 
@@ -129,6 +129,10 @@ foreach ($fold in 0..4) {
     --models configs/2d/models.yaml --fold $fold --gpus 0,1
 }
 
+python scripts/inference/gating_inference.py `
+  --exp configs/2d/exp/exp_prostate_local.yaml --gating-config configs/2d/gating.yaml `
+  --models configs/2d/models.yaml --fold 0
+
 python scripts/eval/eval_methods.py `
   --exp configs/2d/exp/exp_prostate_local.yaml --training configs/2d/training_layer2.yaml `
   --models configs/2d/models.yaml --fold 0
@@ -196,7 +200,7 @@ python scripts/eval/eval_failure_detection_oof.py `
 
 ```powershell
 # Liver 3D（当前数据集）
-$EXP="configs/3d/exp/exp_liver_3d.yaml"; $MODELS="configs/3d/models_3d_liver.yaml"; $DS_ID=3
+$EXP="configs/3d/exp/exp_liver_3d.yaml"; $MODELS="configs/3d/models_3d.yaml"; $DS_ID=3
 
 # Prostate 3D（切换时用这行）
 # $EXP="configs/3d/exp/exp_prostate_local_3d.yaml"; $MODELS="configs/3d/models_3d.yaml"; $DS_ID=2

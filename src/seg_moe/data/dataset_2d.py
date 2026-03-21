@@ -8,7 +8,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from seg_moe.data.transforms import build_albu, imagenet_normalize
+from seg_moe.data.transforms import build_albu, normalize_image
 
 
 class SegmentationDataset2D(Dataset):
@@ -33,6 +33,7 @@ class SegmentationDataset2D(Dataset):
         self.num_classes = int(dataset_cfg["task"]["num_classes"])
         self.image_size = tuple(dataset_cfg["input"]["image_size"])  # H,W
         self.image_channels = int(dataset_cfg["input"].get("image_channels", 3))
+        self.normalize_cfg = dict(dataset_cfg["input"].get("normalize", {}) or {})
         self.label_map = {int(k): int(v) for k, v in dataset_cfg["task"].get("label_map", {}).items()}
 
         self.aug = build_albu(augs_cfg, is_train) if augs_cfg else None
@@ -77,7 +78,7 @@ class SegmentationDataset2D(Dataset):
             mask = augmented["mask"]
 
         # Normalize + to tensor
-        img = imagenet_normalize(img)
+        img = normalize_image(img, self.normalize_cfg)
         img = np.transpose(img, (2, 0, 1))  # CHW
         img_t = torch.from_numpy(img).float()
         mask_t = torch.from_numpy(mask.astype(np.int64))

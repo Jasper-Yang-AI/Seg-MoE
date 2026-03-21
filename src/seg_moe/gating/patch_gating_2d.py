@@ -158,6 +158,27 @@ class PatchConvGate2D(nn.Module):
             use_residual=cfg.use_residual_head,
         )
 
+    def _reshape_expert_maps(self, tensor: torch.Tensor, name: str) -> torch.Tensor:
+        if tensor.dim() == 5:
+            batch, experts, classes, _, _ = tensor.shape
+            if experts != self.cfg.num_experts or classes != self.cfg.num_classes:
+                raise ValueError(
+                    f"{name} shape mismatch: expected [B,{self.cfg.num_experts},{self.cfg.num_classes},H,W], "
+                    f"got {tuple(tensor.shape)}"
+                )
+            return tensor
+        if tensor.dim() == 4:
+            batch, channels, height, width = tensor.shape
+            expected_channels = self.cfg.num_experts * self.cfg.num_classes
+            if channels != expected_channels:
+                raise ValueError(
+                    f"{name} must have {expected_channels} flattened channels, got {channels}"
+                )
+            return tensor.reshape(batch, self.cfg.num_experts, self.cfg.num_classes, height, width)
+        raise ValueError(
+            f"{name} must have shape [B,K,M,H,W] or legacy [B,K*M,H,W], got {tuple(tensor.shape)}"
+        )
+
     def _compute_entropy(self, logits: torch.Tensor) -> torch.Tensor:
         probs = torch.softmax(logits, dim=2)
         entropy = -(probs * torch.log(probs.clamp(min=1e-6))).sum(dim=2, keepdim=True)
@@ -171,18 +192,18 @@ class PatchConvGate2D(nn.Module):
         entropy = self._compute_entropy(logits)
         expert_inputs = torch.cat([logits, entropy], dim=2) if self.cfg.use_entropy else logits
 
-        enc_in = expert_inputs.view(batch * experts, expert_inputs.shape[2], height, width)
+        enc_in = expert_inputs.reshape(batch * experts, expert_inputs.shape[2], height, width)
         feat_map = self.encoder(enc_in)
         pooled_feat, attn = self.pool(feat_map)
-        feat = pooled_feat.view(batch, experts, -1)
+        feat = pooled_feat.reshape(batch, experts, -1)
 
         entropy_small = F.interpolate(
-            entropy.view(batch * experts, 1, height, width),
+            entropy.reshape(batch * experts, 1, height, width),
             size=attn.shape[-2:],
             mode="bilinear",
             align_corners=False,
         )
-        confidence = (entropy_small * attn).flatten(2).sum(dim=-1).view(batch, experts, 1)
+        confidence = (entropy_small * attn).flatten(2).sum(dim=-1).reshape(batch, experts, 1)
         return feat, probs, confidence
 
     def _build_relation_features(self, feat: torch.Tensor, probs: torch.Tensor, confidence: torch.Tensor) -> torch.Tensor:
@@ -211,24 +232,34 @@ class PatchConvGate2D(nn.Module):
         return torch.cat(parts, dim=-1)
 
     def forward(self, logits: torch.Tensor, temperature: float | None = None) -> torch.Tensor:
+        logits = self._reshape_expert_maps(logits, "logits")
         tau = temperature if temperature is not None else self.cfg.temperature_start
         feat, probs, confidence = self._encode_experts(logits)
         relation_feat = self._build_relation_features(feat, probs, confidence)
 
         batch, experts, _ = relation_feat.shape
-        raw_scores = self.score_head(relation_feat.view(batch * experts, -1))
+        raw_scores = self.score_head(relation_feat.reshape(batch * experts, -1))
         if self.cfg.per_class:
-            raw_scores = raw_scores.view(batch, experts, self.cfg.num_classes)
+            raw_scores = raw_scores.reshape(batch, experts, self.cfg.num_classes)
             return F.softmax(raw_scores / tau, dim=1)
-        raw_scores = raw_scores.view(batch, experts)
+        raw_scores = raw_scores.reshape(batch, experts)
         return F.softmax(raw_scores / tau, dim=1)
 
     def fuse_logits(self, logits: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        logits = self._reshape_expert_maps(logits, "logits")
         if weights.dim() == 2:
             weights = weights[:, :, None, None, None]
         else:
             weights = weights[:, :, :, None, None]
         return (logits * weights).sum(dim=1)
+
+    def fuse_probs(self, probs: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        probs = self._reshape_expert_maps(probs, "probs")
+        if weights.dim() == 2:
+            weights = weights[:, :, None, None, None]
+        else:
+            weights = weights[:, :, :, None, None]
+        return (probs * weights).sum(dim=1)
 
     def weights_per_expert(self, weights: torch.Tensor) -> torch.Tensor:
         if weights.dim() == 3:

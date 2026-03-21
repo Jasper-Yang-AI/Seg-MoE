@@ -27,6 +27,7 @@ from torch.utils.data import Dataset
 from seg_moe.data.dataset_3d import (
     SegmentationDataset3D,
     _apply_label_map,
+    _build_user_transforms,
     _percentile_znorm,
     build_3d_transforms,
 )
@@ -108,9 +109,26 @@ class Layer2OOFDataset3D(Dataset):
         self.transform = build_3d_transforms(None, is_train=False, spatial_size=self.spatial_size)
         self._train_crop = is_train
         self._augs_cfg = augs_cfg
+        self._spatial_aug = self._build_spatial_aug(augs_cfg) if is_train else None
 
         # Lazy MONAI import for random crop
         self._crop_fn = None
+
+    def _build_spatial_aug(self, augs_cfg: Optional[Dict[str, Any]]):
+        if not augs_cfg:
+            return None
+        spatial_names = {"RandFlipd", "RandRotate90d", "RandAffined"}
+        aug_list = [aug for aug in (augs_cfg.get("train") or []) if aug.get("name") in spatial_names]
+        if not aug_list:
+            return None
+        try:
+            import monai.transforms as T
+        except ImportError:
+            return None
+        user_aug = _build_user_transforms(aug_list, is_train=True)
+        if not user_aug:
+            return None
+        return T.Compose(user_aug)
 
     def _get_crop_fn(self):
         if self._crop_fn is not None:
@@ -196,7 +214,6 @@ class Layer2OOFDataset3D(Dataset):
             crop_fn = self._get_crop_fn()
             if crop_fn is not None:
                 try:
-                    import monai.transforms as T
                     label_4d = mask_t.unsqueeze(0)
                     result = crop_fn({"image": cat_t, "label": label_4d})
                     if isinstance(result, list):
@@ -205,6 +222,14 @@ class Layer2OOFDataset3D(Dataset):
                     mask_t = result["label"].squeeze(0).long()
                 except Exception:
                     pass  # fall through to full volume if crop fails
+
+        if self._spatial_aug is not None:
+            try:
+                result = self._spatial_aug({"image": cat_t, "label": mask_t.unsqueeze(0)})
+                cat_t = result["image"]
+                mask_t = result["label"].squeeze(0).long()
+            except Exception:
+                pass
 
         meta = {
             "id":         sid,

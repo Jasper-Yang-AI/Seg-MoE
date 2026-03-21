@@ -44,6 +44,15 @@ def sensitivity_precision_from_confusion(
     return sens, prec
 
 
+def _safe_nanmean(values: List[float], default: float) -> float:
+    if not values:
+        return default
+    arr = np.asarray(values, dtype=np.float64)
+    if np.isnan(arr).all():
+        return default
+    return float(np.nanmean(arr))
+
+
 # ── Main metric function ─────────────────────────────────────────────
 
 def compute_segmentation_metrics_batch(
@@ -145,13 +154,13 @@ def compute_segmentation_metrics_batch(
     all_sens, all_precs = [], []
 
     for ci, c in enumerate(range(1, num_classes)):
-        d_val = float(np.nanmean(class_dices[ci])) if class_dices[ci] else 0.0
-        j_val = float(np.nanmean(class_ious[ci])) if class_ious[ci] else 0.0
-        h_val = float(np.nanmean(class_hds[ci])) if class_hds[ci] else float("nan")
-        a_val = float(np.nanmean(class_asds[ci])) if class_asds[ci] else float("nan")
-        n_val = float(np.nanmean(class_nsds[ci])) if class_nsds[ci] else 0.0
-        s_val = float(np.nanmean(class_sens[ci])) if class_sens[ci] else 0.0
-        p_val = float(np.nanmean(class_precs[ci])) if class_precs[ci] else 0.0
+        d_val = _safe_nanmean(class_dices[ci], 0.0)
+        j_val = _safe_nanmean(class_ious[ci], 0.0)
+        h_val = _safe_nanmean(class_hds[ci], float("nan"))
+        a_val = _safe_nanmean(class_asds[ci], float("nan"))
+        n_val = _safe_nanmean(class_nsds[ci], 0.0)
+        s_val = _safe_nanmean(class_sens[ci], 0.0)
+        p_val = _safe_nanmean(class_precs[ci], 0.0)
 
         result[f"dice_c{c}"] = d_val
         result[f"iou_c{c}"] = j_val
@@ -170,13 +179,13 @@ def compute_segmentation_metrics_batch(
         all_precs.append(p_val)
 
     # Aggregated (nanmean over foreground classes)
-    result["dice_mean"] = float(np.nanmean(all_dices)) if all_dices else 0.0
-    result["iou_mean"] = float(np.nanmean(all_ious)) if all_ious else 0.0
-    result["hd95_mean"] = float(np.nanmean(all_hds)) if all_hds else float("nan")
-    result["asd_mean"] = float(np.nanmean(all_asds)) if all_asds else float("nan")
-    result["nsd_mean"] = float(np.nanmean(all_nsds)) if all_nsds else 0.0
-    result["sens_mean"] = float(np.nanmean(all_sens)) if all_sens else 0.0
-    result["prec_mean"] = float(np.nanmean(all_precs)) if all_precs else 0.0
+    result["dice_mean"] = _safe_nanmean(all_dices, 0.0)
+    result["iou_mean"] = _safe_nanmean(all_ious, 0.0)
+    result["hd95_mean"] = _safe_nanmean(all_hds, float("nan"))
+    result["asd_mean"] = _safe_nanmean(all_asds, float("nan"))
+    result["nsd_mean"] = _safe_nanmean(all_nsds, 0.0)
+    result["sens_mean"] = _safe_nanmean(all_sens, 0.0)
+    result["prec_mean"] = _safe_nanmean(all_precs, 0.0)
 
     # Backward compat aliases
     result["hd_mean"] = result["hd95_mean"]

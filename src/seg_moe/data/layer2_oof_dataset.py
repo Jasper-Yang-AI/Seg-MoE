@@ -9,7 +9,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from seg_moe.data.oof import get_oof_prob_path, load_oof_manifest
-from seg_moe.data.transforms import build_albu_for_layer2_with_probs, imagenet_normalize
+from seg_moe.data.transforms import build_albu_for_layer2_with_probs, normalize_image
 
 
 class Layer2OOFDataset(Dataset):
@@ -50,6 +50,7 @@ class Layer2OOFDataset(Dataset):
         self.dataset_cfg = dataset_cfg
         self.num_classes = int(dataset_cfg["task"]["num_classes"])
         self.image_channels = int(dataset_cfg["input"].get("image_channels", 3))
+        self.normalize_cfg = dict(dataset_cfg["input"].get("normalize", {}) or {})
         self.label_map = {int(k): int(v) for k, v in dataset_cfg["task"].get("label_map", {}).items()}
         self.expected_num_experts = int(expected_num_experts) if expected_num_experts is not None else None
         self.add_uncertainty = add_uncertainty
@@ -141,8 +142,8 @@ class Layer2OOFDataset(Dataset):
         if self.image_aug is not None:
             img = self.image_aug(image=img)["image"]
 
-        # Normalize image (replicates grayscale->3ch internally)
-        img = imagenet_normalize(img)
+        # Normalize image only; OOF channels remain in their native probability scale.
+        img = normalize_image(img, self.normalize_cfg)
         img = np.transpose(img, (2, 0, 1))  # CHW
         img_t = torch.from_numpy(img).float()
 
