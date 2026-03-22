@@ -15,12 +15,12 @@ from seg_moe.data.gating_patch_dataset import (
     build_position_channels,
     extract_slice_index,
 )
-from seg_moe.data.oof import get_oof_prob_path, load_oof_manifest
 from seg_moe.data.indexing import infer_num_classes
+from seg_moe.data.oof import get_oof_prob_path, load_oof_manifest
+from seg_moe.data.transforms import imagenet_normalize
 from seg_moe.evaluation.metrics_2d import compute_segmentation_metrics_batch
 from seg_moe.gating.patch_gating_2d import PatchConvGate2D, PatchGatingConfig
 from seg_moe.models.factory_2d import list_experts
-from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl
 from seg_moe.utils.patches import compute_patch_positions, merge_patches_2d
 
@@ -37,39 +37,42 @@ def _load_splits(dataset_cfg: dict) -> list[dict]:
     return load_jsonl(path)
 
 
-def _load_gating_model(ckpt_path: Path, device: torch.device) -> PatchConvGate2D:
+def _load_gating_model(ckpt_path: Path, device: torch.device) -> tuple[PatchConvGate2D, float]:
     """Load trained gating model from checkpoint."""
     state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     gc = state["gate_cfg"]
+    hidden_dim = int(gc["hidden_dim"])
+    temperature = float(state.get("temperature", gc.get("temperature_end", 0.5)))
     cfg = PatchGatingConfig(
-        num_experts=gc["num_experts"],
-        num_classes=gc["num_classes"],
-        image_channels=gc.get("image_channels", 3),
-        patch_size=gc["patch_size"],
-        stride=gc["stride"],
-        hidden_dim=gc["hidden_dim"],
-        dropout=gc["dropout"],
-        per_class=gc["per_class"],
-        use_residual_head=gc.get("use_residual_head", True),
-        use_entropy=gc.get("use_entropy", True),
-        use_consensus_features=gc.get("use_consensus_features", True),
-        use_disagreement_features=gc.get("use_disagreement_features", True),
-        use_confidence_features=gc.get("use_confidence_features", True),
-        use_prior_agreement_features=gc.get("use_prior_agreement_features", False),
-        use_layer1_semantics=gc.get("use_layer1_semantics", False),
-        use_image_context=gc.get("use_image_context", False),
-        use_position_channels=gc.get("use_position_channels", False),
-        use_slice_position=gc.get("use_slice_position", False),
-        use_context_film=gc.get("use_context_film", True),
-        blend_mode=gc.get("blend_mode", "gaussian"),
-        temperature_start=float(state.get("temperature", gc.get("temperature_start", 2.0))),
-        temperature_end=float(gc.get("temperature_end", 0.5)),
+        num_experts=int(gc["num_experts"]),
+        num_classes=int(gc["num_classes"]),
+        image_channels=int(gc.get("image_channels", 3)),
+        patch_size=int(gc["patch_size"]),
+        stride=int(gc["stride"]),
+        hidden_dim=hidden_dim,
+        score_hidden_dim=int(gc.get("score_hidden_dim", hidden_dim)),
+        context_hidden_dim=int(gc.get("context_hidden_dim", 32)),
+        dropout=float(gc.get("dropout", 0.1)),
+        per_class=bool(gc.get("per_class", False)),
+        use_residual_head=bool(gc.get("use_residual_head", True)),
+        use_entropy=bool(gc.get("use_entropy", True)),
+        use_consensus_features=bool(gc.get("use_consensus_features", True)),
+        use_disagreement_features=bool(gc.get("use_disagreement_features", True)),
+        use_confidence_features=bool(gc.get("use_confidence_features", True)),
+        use_prior_agreement_features=bool(gc.get("use_prior_agreement_features", False)),
+        use_layer1_semantics=bool(gc.get("use_layer1_semantics", False)),
+        use_image_context=bool(gc.get("use_image_context", False)),
+        use_position_channels=bool(gc.get("use_position_channels", False)),
+        use_slice_position=bool(gc.get("use_slice_position", False)),
+        use_context_film=bool(gc.get("use_context_film", True)),
+        blend_mode=str(gc.get("blend_mode", "gaussian")),
+        temperature_start=temperature,
+        temperature_end=float(gc.get("temperature_end", temperature)),
     )
     model = PatchConvGate2D(cfg)
     model.load_state_dict(state["model"])
     model.to(device)
     model.eval()
-    temperature = float(state.get("temperature", cfg.temperature_end))
     return model, temperature
 
 
@@ -88,14 +91,14 @@ def _read_image(path: str, image_channels: int) -> np.ndarray:
 
 
 def _load_probs_or_logits(npz_path: Path) -> np.ndarray:
-    data = np.load(npz_path)
-    if "logits" in data:
-        logits = data["logits"].astype(np.float32)
-        logits = logits - logits.max(axis=1, keepdims=True)
-        exp_logits = np.exp(logits)
-        return exp_logits / (exp_logits.sum(axis=1, keepdims=True) + 1e-8)
-    if "probs" in data:
-        return data["probs"].astype(np.float32)
+    with np.load(npz_path) as data:
+        if "logits" in data:
+            logits = data["logits"].astype(np.float32)
+            logits = logits - logits.max(axis=1, keepdims=True)
+            exp_logits = np.exp(logits)
+            return exp_logits / (exp_logits.sum(axis=1, keepdims=True) + 1e-8)
+        if "probs" in data:
+            return data["probs"].astype(np.float32)
     raise KeyError(f"OOF cache missing 'logits'/'probs': {npz_path}")
 
 
@@ -155,6 +158,25 @@ def _build_extra_maps(
     return extra
 
 
+def _extract_extra_patch(
+    extra_maps: dict[str, np.ndarray | float] | None,
+    y: int,
+    x: int,
+    patch_size: int,
+) -> dict[str, torch.Tensor]:
+    if not extra_maps:
+        return {}
+
+    patch: dict[str, torch.Tensor] = {}
+    for key, value in extra_maps.items():
+        if key == "slice_pos":
+            patch[key] = torch.tensor([float(value)], dtype=torch.float32)
+            continue
+        arr = np.asarray(value, dtype=np.float32)
+        patch[key] = torch.from_numpy(arr[..., y : y + patch_size, x : x + patch_size]).float()
+    return patch
+
+
 def infer_single_image(
     logits: np.ndarray,
     model: PatchConvGate2D,
@@ -163,196 +185,109 @@ def infer_single_image(
     temperature: float = 0.5,
     extra_maps: dict[str, np.ndarray | float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Run gating inference on a single image.
-
-    Args:
-        logits: [K, M, H, W] Layer2 expert logits.
-        model: trained gating model.
-        device: torch device.
-        temperature: softmax temperature.
-        extra_maps: optional full-image context maps.
-
-    Returns:
-        fused_logits: [M, H, W]
-        weight_map: [K, H, W]
-        weight_map_per_class: [K, M, H, W]
-    """
+    """Run gating inference on a single image."""
     k, m, height, width = logits.shape
     cfg = model.cfg
-    patch_size = cfg.patch_size
-    stride = cfg.stride
+    patch_size = int(cfg.patch_size)
+    stride = int(cfg.stride)
+    positions = compute_patch_positions(height, width, patch_size, stride)
 
-    positions = compute_patch_positions(H, W, ps, stride)
-
-    # Build patches
-    logits_flat = logits.reshape(K * M, H, W)   # gate input [K*M, H, W]
-    patches_input = []
-    patches_logits = []
+    logits_patches: list[np.ndarray] = []
+    extra_lists: dict[str, list[torch.Tensor]] = {}
     for y, x in positions:
-        patches_input.append(logits_flat[:, y : y + ps, x : x + ps])
-        patches_logits.append(logits[:, :, y : y + ps, x : x + ps])
+        logits_patches.append(logits[:, :, y : y + patch_size, x : x + patch_size])
+        for key, value in _extract_extra_patch(extra_maps, y, x, patch_size).items():
+            extra_lists.setdefault(key, []).append(value)
 
-    input_batch = torch.from_numpy(np.stack(patches_input)).float().to(device)
-    logits_batch = torch.from_numpy(np.stack(patches_logits)).float().to(device)
+    logits_batch = torch.from_numpy(np.stack(logits_patches, axis=0)).float().to(device)
+    extra_batch = {
+        key: torch.stack(value, dim=0).to(device)
+        for key, value in extra_lists.items()
+    }
 
     with torch.no_grad():
-        weights = model(input_batch, temperature=temperature)       # [N, K] or [N, K, M]
-        fused_patches = model.fuse_logits(logits_batch, weights)    # [N, M, pH, pW]
+        weights = model(
+            logits_batch,
+            extra=extra_batch if extra_batch else None,
+            temperature=temperature,
+        )
+        fused_patches = model.fuse_logits(logits_batch, weights)
 
     fused_list = [fused_patches[i].cpu().numpy() for i in range(len(positions))]
-    fused_map = merge_patches_2d(fused_list, positions, (height, width), patch_size, blend_mode=cfg.blend_mode)
+    fused_map = merge_patches_2d(
+        fused_list,
+        positions,
+        (height, width),
+        patch_size,
+        blend_mode=cfg.blend_mode,
+    )
 
     weights_np = weights.cpu().numpy()
     if weights_np.ndim == 3:
         weights_expert = weights_np.mean(axis=2)
         flat_patches = [
-            np.broadcast_to(weights_np[i][:, :, None, None], (K, M, ps, ps)).copy().reshape(C_km, ps, ps)
+            np.broadcast_to(weights_np[i][:, :, None, None], (k, m, patch_size, patch_size))
+            .copy()
+            .reshape(k * m, patch_size, patch_size)
             for i in range(len(positions))
         ]
-        w_km = merge_patches_2d(flat_patches, positions, (height, width), patch_size, blend_mode=cfg.blend_mode)
-        weight_map_per_class = w_km.reshape(k, m, height, width)
+        merged = merge_patches_2d(
+            flat_patches,
+            positions,
+            (height, width),
+            patch_size,
+            blend_mode=cfg.blend_mode,
+        )
+        weight_map_per_class = merged.reshape(k, m, height, width)
     else:
         weights_expert = weights_np
         weight_map_per_class = None
 
-    w_expert_patches = [
-        np.broadcast_to(weights_expert[i][:, None, None], (K, ps, ps)).copy()
+    expert_weight_patches = [
+        np.broadcast_to(weights_expert[i][:, None, None], (k, patch_size, patch_size)).copy()
         for i in range(len(positions))
     ]
-    weight_map = merge_patches_2d(w_expert_patches, positions, (H, W), ps, blend_mode=cfg.blend_mode)
+    weight_map = merge_patches_2d(
+        expert_weight_patches,
+        positions,
+        (height, width),
+        patch_size,
+        blend_mode=cfg.blend_mode,
+    )
 
     if weight_map_per_class is None:
-        weight_map_per_class = np.repeat(weight_map[:, None, :, :], M, axis=1)  # [K,M,H,W]
-
-    return fused_map, weight_map, weight_map_per_class
-    """Run gating inference on a single image.
-
-    Args:
-        probs:  [K, M, H, W] Layer2 expert probability maps (float32)
-        model:  trained gating model
-        device: torch device
-        temperature: gating softmax temperature
-        logits: [K, M, H, W] raw logits (required when model.cfg.fusion_domain == "logits")
-
-    Returns:
-        fused_map:   [M, H, W]  fused prediction map (probs or logits, depending on fusion_domain)
-        weight_map:  [K, H, W]  per-expert spatial weight map (blended, averaged over classes)
-        weight_map_per_class: [K, M, H, W]  per-expert per-class spatial weight map
-    """
-    K, M, H, W = probs.shape
-    cfg = model.cfg
-    ps = cfg.patch_size
-    stride = cfg.stride
-    fusion_domain = cfg.fusion_domain
-    input_domain = cfg.input_domain
-
-    positions = compute_patch_positions(H, W, ps, stride)
-
-    # Prepare flattened input (probs, logits, or concat)
-    probs_flat = probs.reshape(K * M, H, W)
-    if input_domain == "logits":
-        if logits is None:
-            raise ValueError("input_domain='logits' but logits=None. Pass logits array.")
-        logits_flat = logits.reshape(K * M, H, W)
-        gate_input = logits_flat
-    elif input_domain == "probs+logits":
-        if logits is None:
-            raise ValueError("input_domain='probs+logits' but logits=None. Pass logits array.")
-        logits_flat = logits.reshape(K * M, H, W)
-        gate_input = np.concatenate([probs_flat, logits_flat], axis=0)  # [K*2M, H, W]
-    else:
-        gate_input = probs_flat  # [K*M, H, W]
-
-    # Collect patches
-    patches_input = []
-    patches_probs = []
-    patches_logits = []
-    for y, x in positions:
-        patches_input.append(gate_input[:, y : y + ps, x : x + ps])
-        patches_probs.append(probs[:, :, y : y + ps, x : x + ps])
-        if logits is not None:
-            patches_logits.append(logits[:, :, y : y + ps, x : x + ps])
-
-    input_batch = torch.from_numpy(np.stack(patches_input, axis=0)).float().to(device)
-    probs_batch = torch.from_numpy(np.stack(patches_probs, axis=0)).float().to(device)
-    if patches_logits:
-        logits_batch = torch.from_numpy(np.stack(patches_logits, axis=0)).float().to(device)
-
-    with torch.no_grad():
-        weights = model(input_batch, temperature=temperature)  # [N, K] or [N, K, M]
-        if fusion_domain == "logits" and patches_logits:
-            fused_patches = model.fuse_logits(logits_batch, weights)  # [N, M, pH, pW]
-        else:
-            fused_patches = model.fuse_probs(probs_batch, weights)    # [N, M, pH, pW]
-
-    # Merge fused patches
-    fused_list = [fused_patches[i].cpu().numpy() for i in range(len(positions))]
-    fused_map = merge_patches_2d(fused_list, positions, (H, W), ps, blend_mode=cfg.blend_mode)
-
-    # Build per-expert weight map — PRESERVE per-class resolution
-    weights_np = weights.cpu().numpy()  # [N, K] or [N, K, M]
-    if weights_np.ndim == 3:
-        # per_class=True: [N, K, M]
-        # Per-expert collapsed (mean over classes) → [N, K]
-        weights_expert = weights_np.mean(axis=2)      # [N, K]
-        # Per-class per-expert maps → [K, M, H, W]
-        per_class_patches = []
-        for i in range(len(positions)):
-            w_km = weights_np[i]           # [K, M]
-            w_spatial = np.broadcast_to(
-                w_km[:, :, None, None], (K, M, ps, ps)
-            ).copy()                        # [K, M, pH, pW]
-            per_class_patches.append(w_spatial)
-        # Merge per-class weight patches: treat [K*M] as channels
-        C_km = K * M
-        flat_patches = [p.reshape(C_km, ps, ps) for p in per_class_patches]
-        w_km_spatial = merge_patches_2d(flat_patches, positions, (H, W), ps, blend_mode=cfg.blend_mode)
-        weight_map_per_class = w_km_spatial.reshape(K, M, H, W)
-    else:
-        weights_expert = weights_np    # [N, K]
-        # Expand [K] → [K, M] by replicating for all classes
-        weight_map_per_class = None    # will construct below from weight_map
-
-    # Merge per-expert collapsed weight map
-    w_expert_patches = []
-    for i in range(len(positions)):
-        w = weights_expert[i]   # [K]
-        w_spatial = np.broadcast_to(w[:, None, None], (K, ps, ps)).copy()
-        w_expert_patches.append(w_spatial)
-    weight_map = merge_patches_2d(w_expert_patches, positions, (H, W), ps, blend_mode=cfg.blend_mode)
-
-    if weight_map_per_class is None:
-        # Replicate weight_map [K,H,W] over M classes
-        weight_map_per_class = np.repeat(weight_map[:, None, :, :], M, axis=1)  # [K,M,H,W]
+        weight_map_per_class = np.repeat(weight_map[:, None, :, :], m, axis=1)
 
     return fused_map, weight_map, weight_map_per_class
 
 
 def main() -> None:
+    from seg_moe.utils.config import load_config, resolve_run_dir
+
     ap = argparse.ArgumentParser(description="Gating dynamic fusion inference")
     ap.add_argument("--exp", required=True)
     ap.add_argument("--gating-config", required=True)
     ap.add_argument("--models", required=True)
     ap.add_argument("--fold", type=int, default=0)
-    ap.add_argument("--split", type=str, default=None,
-                    help="Split to evaluate (default: val_fold{fold})")
-    ap.add_argument("--temperature", type=float, default=None,
-                    help="Override gating temperature (default: from checkpoint)")
-    ap.add_argument("--save-weights", action="store_true",
-                    help="Save per-expert gating weight maps (.npz + PNG heatmaps)")
-    ap.add_argument("--save-weight-png", action="store_true",
-                    help="Also save per-expert weight maps as PNG heatmaps (requires --save-weights)")
+    ap.add_argument("--split", type=str, default=None, help="Split to evaluate (default: val_fold{fold})")
+    ap.add_argument("--temperature", type=float, default=None, help="Override gating temperature")
+    ap.add_argument("--save-weights", action="store_true", help="Save per-expert gating weight maps")
+    ap.add_argument(
+        "--save-weight-png",
+        action="store_true",
+        help="Also save per-expert weight maps as PNG heatmaps (requires --save-weights)",
+    )
     ap.add_argument("--gpus", type=str, default=None)
     args = ap.parse_args()
 
     exp_cfg = load_config(args.exp)
-    gating_cfg_raw = load_config(args.gating_config)
+    _ = load_config(args.gating_config)
     models_cfg = load_config(args.models)
     dataset_cfg = load_config(exp_cfg["dataset"]["config"])
 
     num_classes = infer_num_classes(dataset_cfg)
-    K = len(list_experts(models_cfg))
-    fold = args.fold
+    expected_experts = len(list_experts(models_cfg))
+    fold = int(args.fold)
     split = args.split or f"val_fold{fold}"
 
     if torch.cuda.is_available():
@@ -367,19 +302,22 @@ def main() -> None:
         raise FileNotFoundError(
             f"Gating checkpoint not found: {ckpt_path}. Run scripts/train/train_gating.py first."
         )
-    model = _load_gating_model(ckpt_path, device)
+    model, ckpt_temperature = _load_gating_model(ckpt_path, device)
 
-    temperature = args.temperature
-    if temperature is None:
-        state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        temperature = float(state.get("temperature", model.cfg.temperature_end))
-    print(f"Gating inference | fold={fold} split={split} τ={temperature:.2f} domain=logits")
+    if model.cfg.num_classes != num_classes:
+        raise ValueError(
+            f"Gating checkpoint expects num_classes={model.cfg.num_classes}, but dataset has {num_classes}"
+        )
+    if model.cfg.num_experts != expected_experts:
+        raise ValueError(
+            f"Gating checkpoint expects num_experts={model.cfg.num_experts}, but models config has {expected_experts}"
+        )
 
-    # OOF probs (来源: Layer2 OOF, 非 Layer1)
-    cache_root = Path(
-        exp_cfg["layering"]["cache_root"].replace("${exp_name}", exp_cfg["exp_name"])
-    )
-    oof_manifest_path = Path(
+    temperature = float(args.temperature) if args.temperature is not None else ckpt_temperature
+    print(f"Gating inference | fold={fold} split={split} tau={temperature:.2f} domain=logits")
+
+    cache_root = Path(exp_cfg["layering"]["cache_root"].replace("${exp_name}", exp_cfg["exp_name"]))
+    l2_oof_manifest_path = Path(
         str(
             exp_cfg.get("layering", {}).get(
                 "l2_oof_manifest_path",
@@ -426,21 +364,34 @@ def main() -> None:
     label_map = {int(k): int(v) for k, v in dataset_cfg["task"].get("label_map", {}).items()}
     all_metrics: list[dict] = []
 
-    for s in tqdm(eval_rows, desc=f"gating inference {split}"):
-        sid = str(s["id"])
-        if sid not in oof_map:
+    for sample in tqdm(eval_rows, desc=f"gating inference {split}"):
+        sid = str(sample["id"])
+        if sid not in l2_oof_map:
             continue
 
-        probs_data = np.load(get_oof_prob_path(oof_map, sid))
-        if "logits" in probs_data:
-            logits_arr = probs_data["logits"].astype(np.float32)
-        else:
-            # Legacy fallback: log-odds from probs
-            p = probs_data["probs"].astype(np.float32).clip(1e-6, 1 - 1e-6)
-            logits_arr = np.log(p / (1 - p))
+        prob_path = get_oof_prob_path(l2_oof_map, sid)
+        with np.load(prob_path) as probs_data:
+            if "logits" in probs_data:
+                logits_arr = probs_data["logits"].astype(np.float32)
+            elif "probs" in probs_data:
+                probs = probs_data["probs"].astype(np.float32).clip(1e-6, 1 - 1e-6)
+                logits_arr = np.log(probs / (1 - probs))
+            else:
+                raise KeyError(f"OOF cache missing 'logits'/'probs': {prob_path}")
 
+        extra_maps = _build_extra_maps(
+            sample,
+            model.cfg,
+            logits_arr.shape[-2:],
+            l1_oof_map,
+            slice_pos_map,
+        )
         fused, weight_map, weight_map_per_class = infer_single_image(
-            logits_arr, model, device, temperature,
+            logits_arr,
+            model,
+            device,
+            temperature=temperature,
+            extra_maps=extra_maps if extra_maps else None,
         )
 
         mask = np.array(Image.open(sample["mask_path"]).convert("L"), dtype=np.uint8)
@@ -453,43 +404,46 @@ def main() -> None:
         pred = np.argmax(fused, axis=0).astype(np.int64)
         fused_probs = torch.from_numpy(fused).unsqueeze(0).float().softmax(dim=1)
         mask_t = torch.from_numpy(mask.astype(np.int64)).unsqueeze(0)
-        metrics = compute_segmentation_metrics_batch(
-            fused_probs, mask_t, num_classes=num_classes,
-        )
+        metrics = compute_segmentation_metrics_batch(fused_probs, mask_t, num_classes=num_classes)
         metrics["sample_id"] = sid
         all_metrics.append(metrics)
 
-        # Save predictions
         np.savez_compressed(out_dir / f"{sid}.npz", fused=fused, pred=pred)
 
-        # Save weight maps
         if args.save_weights:
             np.savez_compressed(
                 out_dir / "weight_maps" / f"{sid}.npz",
-                weight_map=weight_map,              # [K, H, W]  averaged over classes
-                weight_map_per_class=weight_map_per_class,  # [K, M, H, W]  class-resolved
+                weight_map=weight_map,
+                weight_map_per_class=weight_map_per_class,
             )
             if args.save_weight_png:
                 png_dir = out_dir / "weight_maps" / "png"
-                for k in range(weight_map.shape[0]):
-                    w_k = weight_map[k]             # [H, W]  in [0, 1]
+                for expert_idx in range(weight_map.shape[0]):
+                    w_k = weight_map[expert_idx]
                     w_uint8 = (w_k * 255).clip(0, 255).astype(np.uint8)
-                    Image.fromarray(w_uint8).save(png_dir / f"{sid}_expert{k}.png")
+                    Image.fromarray(w_uint8).save(png_dir / f"{sid}_expert{expert_idx}.png")
 
-    # Aggregate metrics
     if all_metrics:
         mean_dice = float(np.mean([m.get("dice_mean", 0.0) for m in all_metrics]))
         print(f"\nGating fusion | {split} | mean Dice = {mean_dice:.4f}")
 
-        # Save metrics
-        with open(out_dir / "metrics.json", "w") as f:
+        with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
             json.dump(
-                {"split": split, "fold": fold, "mean_dice": mean_dice,
-                 "n_samples": len(all_metrics), "temperature": temperature,
-                 "per_sample": all_metrics},
-                f, indent=2, default=str,
+                {
+                    "split": split,
+                    "fold": fold,
+                    "mean_dice": mean_dice,
+                    "n_samples": len(all_metrics),
+                    "temperature": temperature,
+                    "per_sample": all_metrics,
+                },
+                f,
+                indent=2,
+                default=str,
             )
         print(f"Results saved to {out_dir}")
+    else:
+        print(f"No evaluable samples found for split={split}")
 
 
 if __name__ == "__main__":

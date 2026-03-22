@@ -255,7 +255,6 @@ class PatchConvGate2D(nn.Module):
             use_residual=cfg.use_residual_head,
         )
 
-<<<<<<< HEAD
     def _reshape_expert_maps(self, tensor: torch.Tensor, name: str) -> torch.Tensor:
         if tensor.dim() == 5:
             batch, experts, classes, _, _ = tensor.shape
@@ -276,21 +275,6 @@ class PatchConvGate2D(nn.Module):
         raise ValueError(
             f"{name} must have shape [B,K,M,H,W] or legacy [B,K*M,H,W], got {tuple(tensor.shape)}"
         )
-=======
-    def _ensure_structured_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        if logits.dim() == 5:
-            return logits
-        if logits.dim() == 4:
-            batch, channels, height, width = logits.shape
-            expected = self.cfg.num_experts * self.cfg.num_classes
-            if channels != expected:
-                raise ValueError(
-                    f"Flattened gating input has {channels} channels, expected K*M={expected}. "
-                    f"(K={self.cfg.num_experts}, M={self.cfg.num_classes})"
-                )
-            return logits.view(batch, self.cfg.num_experts, self.cfg.num_classes, height, width)
-        raise ValueError(f"Expected logits [B,K,M,H,W] or [B,K*M,H,W], got shape={tuple(logits.shape)}")
->>>>>>> 56b114fffa9dde7e924636de097c41fc5beac734
 
     def _compute_entropy(self, logits: torch.Tensor) -> torch.Tensor:
         probs = torch.softmax(logits, dim=2)
@@ -300,7 +284,7 @@ class PatchConvGate2D(nn.Module):
         return entropy
 
     def _encode_experts(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits = self._ensure_structured_logits(logits)
+        logits = self._reshape_expert_maps(logits, "logits")
         batch, experts, _, height, width = logits.shape
         probs = torch.softmax(logits, dim=2)
         entropy = self._compute_entropy(logits)
@@ -308,14 +292,9 @@ class PatchConvGate2D(nn.Module):
 
         enc_in = expert_inputs.reshape(batch * experts, expert_inputs.shape[2], height, width)
         feat_map = self.encoder(enc_in)
-<<<<<<< HEAD
-        pooled_feat, attn = self.pool(feat_map)
-        feat = pooled_feat.reshape(batch, experts, -1)
-=======
         attn_feat, attn = self.pool(feat_map)
         avg_feat = F.adaptive_avg_pool2d(feat_map, output_size=1).flatten(1)
         feat = torch.cat([attn_feat, avg_feat], dim=1).view(batch, experts, -1)
->>>>>>> 56b114fffa9dde7e924636de097c41fc5beac734
 
         entropy_small = F.interpolate(
             entropy.reshape(batch * experts, 1, height, width),
@@ -421,17 +400,12 @@ class PatchConvGate2D(nn.Module):
 
         return torch.cat(parts, dim=-1)
 
-<<<<<<< HEAD
-    def forward(self, logits: torch.Tensor, temperature: float | None = None) -> torch.Tensor:
-        logits = self._reshape_expert_maps(logits, "logits")
-=======
     def forward(
         self,
         logits: torch.Tensor,
         extra: dict[str, torch.Tensor] | None = None,
         temperature: float | None = None,
     ) -> torch.Tensor:
->>>>>>> 56b114fffa9dde7e924636de097c41fc5beac734
         tau = temperature if temperature is not None else self.cfg.temperature_start
         feat, probs, confidence = self._encode_experts(logits)
         context_vec = self._encode_context(extra)
@@ -447,11 +421,7 @@ class PatchConvGate2D(nn.Module):
         return F.softmax(raw_scores / tau, dim=1)
 
     def fuse_logits(self, logits: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-<<<<<<< HEAD
         logits = self._reshape_expert_maps(logits, "logits")
-=======
-        logits = self._ensure_structured_logits(logits)
->>>>>>> 56b114fffa9dde7e924636de097c41fc5beac734
         if weights.dim() == 2:
             weights = weights[:, :, None, None, None]
         else:
@@ -459,11 +429,7 @@ class PatchConvGate2D(nn.Module):
         return (logits * weights).sum(dim=1)
 
     def fuse_probs(self, probs: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-<<<<<<< HEAD
         probs = self._reshape_expert_maps(probs, "probs")
-=======
-        probs = self._ensure_structured_logits(probs)
->>>>>>> 56b114fffa9dde7e924636de097c41fc5beac734
         if weights.dim() == 2:
             weights = weights[:, :, None, None, None]
         else:
