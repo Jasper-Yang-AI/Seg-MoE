@@ -33,11 +33,40 @@ def _default_cfg(**kw) -> PatchGatingConfig:
 
 
 class TestPatchConvGate2D:
+    def test_output_shape_structured_logits(self):
+        cfg = _default_cfg(per_class=False)
+        model = PatchConvGate2D(cfg)
+        x = torch.randn(4, K, M, PH, PW)
+        w = model(x)
+        assert w.shape == (4, K)
+
     def test_output_shape_per_expert(self):
         model = PatchConvGate2D(_default_cfg(per_class=False))
         x = torch.randn(4, K, M, PH, PW)
         w = model(x)
         assert w.shape == (4, K)
+
+    def test_context_forward_shape(self):
+        cfg = _default_cfg(
+            per_class=True,
+            use_layer1_semantics=True,
+            use_image_context=True,
+            use_position_channels=True,
+            use_slice_position=True,
+            use_prior_agreement_features=True,
+        )
+        model = PatchConvGate2D(cfg)
+        x = torch.randn(2, K, M, PH, PW)
+        extra = {
+            "image": torch.randn(2, 3, PH, PW),
+            "layer1_mean": torch.randn(2, M, PH, PW).softmax(dim=1),
+            "layer1_entropy": torch.rand(2, 1, PH, PW),
+            "layer1_disagreement": torch.rand(2, M, PH, PW),
+            "coords": torch.rand(2, 2, PH, PW),
+            "slice_pos": torch.rand(2, 1),
+        }
+        w = model(x, extra=extra)
+        assert w.shape == (2, K, M)
 
     def test_output_shape_per_class(self):
         model = PatchConvGate2D(_default_cfg(per_class=True))
