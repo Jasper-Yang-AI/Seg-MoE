@@ -1,0 +1,95 @@
+# Dual RTX 5090 runtime-optimized 2D gating config
+#
+# Target machine:
+# - 2x RTX 5090 32GB
+# - 128GB system RAM
+# - Windows host
+#
+# Strategy:
+# - Keep the original gate architecture
+# - Use a larger global batch to reduce CPU overhead
+# - Group patches by slice so bounded caches stay effective
+# - Use bounded in-memory caches instead of full-dataset caching
+# - Enable early stopping because gating converges faster than Layer2 experts
+
+gating:
+  hidden_dim: 64
+  score_hidden_dim: 64
+  context_hidden_dim: 32
+  dropout: 0.1
+
+  per_class: true
+  use_residual_head: true
+  use_entropy: true
+  use_consensus_features: true
+  use_disagreement_features: true
+  use_confidence_features: true
+  use_prior_agreement_features: true
+
+  use_layer1_semantics: true
+  use_image_context: true
+  use_position_channels: true
+  use_slice_position: true
+  use_context_film: true
+
+  patch_size: 64
+  stride: 32
+  blend_mode: "gaussian"
+
+  temperature_start: 2.0
+  temperature_end: 0.6
+
+  load_balance_weight: 0.01
+  spatial_smooth_weight: 0.002
+  foreground_oversample_ratio: 0.5
+
+data:
+  cache_in_memory: true
+  cache_max_items: 96
+  train_sampler: "sample_grouped"
+  shuffle_patches_within_sample: true
+
+training:
+  batch_size: 512
+  epochs: 40
+  lr: 8.0e-4
+
+  optimizer:
+    name: "adamw"
+    weight_decay: 0.01
+
+  scheduler:
+    name: "cosine"
+    min_lr: 1.0e-6
+    warmup_epochs: 4
+
+  amp:
+    enabled: true
+    dtype: "bfloat16"
+
+  loss:
+    name: "ce_plus_dice"
+    dice_smooth: 1.0
+    ce_weight: 1.0
+    dice_weight: 1.0
+
+  dataloader:
+    num_workers: 2
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+
+  early_stopping:
+    enabled: true
+    patience: 8
+    min_epochs: 12
+    min_delta: 5.0e-4
+
+  checkpoint:
+    save_best: true
+    save_last: true
+    monitor: "val_dice"
+
+  logging:
+    log_interval: 50
+    val_interval: 1

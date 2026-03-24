@@ -1,15 +1,17 @@
 """Patch dataset for 2D gating with optional semantic priors and anatomy context."""
 from __future__ import annotations
 
+import math
 import random
 import re
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from seg_moe.data.oof import get_oof_prob_path, load_oof_manifest
 from seg_moe.data.transforms import imagenet_normalize
@@ -61,6 +63,85 @@ def extract_slice_index(sample_id: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+class SampleGroupedBatchSampler(Sampler[list[int]]):
+    """Batch sampler that keeps patches from the same slice close together.
+
+    This improves cache locality for gating because each slice contributes many
+    overlapping patches. Optionally replaces part of a sample's background
+    patches with foreground patches from the same sample to keep foreground
+    density similar to the legacy random-oversample path.
+    """
+
+    def __init__(
+        self,
+        sample_patch_ranges: list[tuple[int, int]],
+        *,
+        batch_size: int,
+        sample_fg_indices: list[list[int]] | None = None,
+        drop_last: bool = True,
+        shuffle_samples: bool = True,
+        shuffle_patches_within_sample: bool = True,
+        foreground_oversample_ratio: float = 0.0,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.sample_patch_ranges = list(sample_patch_ranges)
+        self.sample_fg_indices = sample_fg_indices or [[] for _ in self.sample_patch_ranges]
+        if len(self.sample_fg_indices) != len(self.sample_patch_ranges):
+            raise ValueError("sample_fg_indices must match sample_patch_ranges length")
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+        self.shuffle_samples = bool(shuffle_samples)
+        self.shuffle_patches_within_sample = bool(shuffle_patches_within_sample)
+        self.foreground_oversample_ratio = max(0.0, float(foreground_oversample_ratio))
+        self._num_indices = sum(max(0, end - start) for start, end in self.sample_patch_ranges)
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return self._num_indices // self.batch_size
+        return int(math.ceil(self._num_indices / max(1, self.batch_size)))
+
+    def _indices_for_sample(self, sample_idx: int) -> list[int]:
+        start, end = self.sample_patch_ranges[sample_idx]
+        indices = list(range(start, end))
+        if self.shuffle_patches_within_sample:
+            random.shuffle(indices)
+
+        fg_indices = self.sample_fg_indices[sample_idx]
+        if self.foreground_oversample_ratio <= 0 or not fg_indices:
+            return indices
+
+        fg_set = set(fg_indices)
+        bg_positions = [pos for pos, patch_idx in enumerate(indices) if patch_idx not in fg_set]
+        if not bg_positions:
+            return indices
+
+        n_replace = min(len(bg_positions), int(round(len(indices) * self.foreground_oversample_ratio)))
+        if n_replace <= 0:
+            return indices
+
+        replace_positions = random.sample(bg_positions, n_replace)
+        for pos in replace_positions:
+            indices[pos] = random.choice(fg_indices)
+        return indices
+
+    def __iter__(self):
+        sample_order = list(range(len(self.sample_patch_ranges)))
+        if self.shuffle_samples:
+            random.shuffle(sample_order)
+
+        batch: list[int] = []
+        for sample_idx in sample_order:
+            for patch_idx in self._indices_for_sample(sample_idx):
+                batch.append(patch_idx)
+                if len(batch) == self.batch_size:
+                    yield batch
+                    batch = []
+
+        if batch and not self.drop_last:
+            yield batch
+
+
 class GatingPatchDataset(Dataset):
     """Patch dataset for 2D gating training.
 
@@ -85,6 +166,7 @@ class GatingPatchDataset(Dataset):
         foreground_oversample_ratio: float = 0.0,
         limit: int | None = None,
         cache_in_memory: bool = True,
+        cache_max_items: int | None = None,
         layer1_oof_manifest_path: str | Path | None = None,
         use_layer1_semantics: bool = False,
         use_image_context: bool = False,
@@ -104,6 +186,7 @@ class GatingPatchDataset(Dataset):
             for k, v in dataset_cfg["task"].get("label_map", {}).items()
         }
         self.cache_in_memory = cache_in_memory
+        self.cache_max_items = int(cache_max_items) if cache_max_items is not None else None
         self.use_layer1_semantics = bool(use_layer1_semantics)
         self.use_image_context = bool(use_image_context)
         self.use_position_channels = bool(use_position_channels)
@@ -122,17 +205,46 @@ class GatingPatchDataset(Dataset):
         if limit and limit < len(self.samples):
             self.samples = self.samples[:limit]
 
-        self._logits_cache: dict[str, np.ndarray] = {}
-        self._mask_cache: dict[str, np.ndarray] = {}
-        self._image_cache: dict[str, np.ndarray] = {}
-        self._layer1_semantic_cache: dict[str, np.ndarray] = {}
+        self._logits_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._mask_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._image_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._layer1_semantic_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._position_cache: dict[tuple[int, int], np.ndarray] = {}
         self._slice_pos: dict[str, float] = {}
         self._patch_index: list[tuple[int, tuple[int, int]]] = []
         self._fg_index: list[int] = []
+        self._sample_patch_ranges: list[tuple[int, int]] = []
+        self._sample_fg_indices: list[list[int]] = []
 
         self._build_slice_positions()
         self._build_patch_index()
+
+    @property
+    def sample_patch_ranges(self) -> list[tuple[int, int]]:
+        return list(self._sample_patch_ranges)
+
+    @property
+    def sample_fg_indices(self) -> list[list[int]]:
+        return [list(v) for v in self._sample_fg_indices]
+
+    def _get_cached(self, cache: OrderedDict[str, np.ndarray], key: str) -> np.ndarray | None:
+        if not self.cache_in_memory:
+            return None
+        value = cache.get(key)
+        if value is None:
+            return None
+        cache.move_to_end(key)
+        return value
+
+    def _put_cached(self, cache: OrderedDict[str, np.ndarray], key: str, value: np.ndarray) -> np.ndarray:
+        if not self.cache_in_memory:
+            return value
+        cache[key] = value
+        cache.move_to_end(key)
+        if self.cache_max_items is not None:
+            while len(cache) > self.cache_max_items:
+                cache.popitem(last=False)
+        return value
 
     def _read_image(self, path: str) -> np.ndarray:
         img = Image.open(path)
@@ -188,27 +300,31 @@ class GatingPatchDataset(Dataset):
 
     def _get_logits(self, sample: dict) -> np.ndarray:
         sid = str(sample["id"])
-        if sid not in self._logits_cache:
-            self._logits_cache[sid] = self._load_logits(sid)
-        return self._logits_cache[sid]
+        cached = self._get_cached(self._logits_cache, sid)
+        if cached is not None:
+            return cached
+        return self._put_cached(self._logits_cache, sid, self._load_logits(sid))
 
     def _get_mask(self, sample: dict) -> np.ndarray:
         sid = str(sample["id"])
-        if sid not in self._mask_cache:
-            self._mask_cache[sid] = self._load_mask(sample)
-        return self._mask_cache[sid]
+        cached = self._get_cached(self._mask_cache, sid)
+        if cached is not None:
+            return cached
+        return self._put_cached(self._mask_cache, sid, self._load_mask(sample))
 
     def _get_image(self, sample: dict) -> np.ndarray:
         sid = str(sample["id"])
-        if sid not in self._image_cache:
-            self._image_cache[sid] = self._read_image(sample["image_path"])
-        return self._image_cache[sid]
+        cached = self._get_cached(self._image_cache, sid)
+        if cached is not None:
+            return cached
+        return self._put_cached(self._image_cache, sid, self._read_image(sample["image_path"]))
 
     def _get_layer1_semantics(self, sample: dict) -> np.ndarray:
         sid = str(sample["id"])
-        if sid not in self._layer1_semantic_cache:
-            self._layer1_semantic_cache[sid] = self._load_layer1_semantics(sid)
-        return self._layer1_semantic_cache[sid]
+        cached = self._get_cached(self._layer1_semantic_cache, sid)
+        if cached is not None:
+            return cached
+        return self._put_cached(self._layer1_semantic_cache, sid, self._load_layer1_semantics(sid))
 
     def _get_position_channels(self, height: int, width: int) -> np.ndarray:
         key = (height, width)
@@ -245,22 +361,20 @@ class GatingPatchDataset(Dataset):
 
     def _build_patch_index(self) -> None:
         for sample_idx, sample in enumerate(self.samples):
-            logits = self._get_logits(sample)
             mask = self._get_mask(sample)
-            _, _, height, width = logits.shape
-            if mask.shape != (height, width):
-                raise ValueError(
-                    f"Gating mask/logit shape mismatch for {sample['id']}: "
-                    f"mask={mask.shape}, logits={(height, width)}"
-                )
-
+            height, width = mask.shape
             positions = compute_patch_positions(height, width, self.patch_size, self.stride)
+            start_idx = len(self._patch_index)
+            sample_fg_indices: list[int] = []
             for pos in positions:
                 y, x = pos
                 patch_idx = len(self._patch_index)
                 self._patch_index.append((sample_idx, pos))
                 if (mask[y : y + self.patch_size, x : x + self.patch_size] > 0).any():
                     self._fg_index.append(patch_idx)
+                    sample_fg_indices.append(patch_idx)
+            self._sample_patch_ranges.append((start_idx, len(self._patch_index)))
+            self._sample_fg_indices.append(sample_fg_indices)
 
         if not self._fg_index:
             self._fg_index = list(range(len(self._patch_index)))
@@ -283,6 +397,11 @@ class GatingPatchDataset(Dataset):
         sid = str(sample["id"])
         logits = self._get_logits(sample) if self.cache_in_memory else self._load_logits(sid)
         mask = self._get_mask(sample) if self.cache_in_memory else self._load_mask(sample)
+        if mask.shape != tuple(logits.shape[-2:]):
+            raise ValueError(
+                f"Gating mask/logit shape mismatch for {sample['id']}: "
+                f"mask={mask.shape}, logits={tuple(logits.shape[-2:])}"
+            )
 
         ps = self.patch_size
         logits_patch = logits[:, :, y : y + ps, x : x + ps].copy()

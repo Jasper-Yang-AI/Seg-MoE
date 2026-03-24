@@ -125,12 +125,12 @@ python scripts/inference/generate_layer2_oof.py `
 
 foreach ($fold in 0..4) {
   python scripts/train/train_gating.py `
-    --exp configs/2d/exp/exp_prostate_local.yaml --gating-config configs/2d/gating.yaml `
+    --exp configs/2d/exp/exp_prostate_local.yaml --gating-config configs/2d/gating_dual_5090.yaml `
     --models configs/2d/models.yaml --fold $fold --gpus 0,1
 }
 
 python scripts/inference/gating_inference.py `
-  --exp configs/2d/exp/exp_prostate_local.yaml --gating-config configs/2d/gating.yaml `
+  --exp configs/2d/exp/exp_prostate_local.yaml --gating-config configs/2d/gating_dual_5090.yaml `
   --models configs/2d/models.yaml --fold 0
 
 python scripts/eval/eval_methods.py `
@@ -138,6 +138,19 @@ python scripts/eval/eval_methods.py `
   --models configs/2d/models.yaml --fold 0
 python scripts/eval/export_tables.py --exp configs/2d/exp/exp_prostate_local.yaml --folds 0
 ```
+
+**Gating（双 RTX 5090 / 128GB RAM / Windows）推荐配置**：`configs/2d/gating_dual_5090.yaml`
+
+- 使用 `sample_grouped` patch 采样，尽量让同一张 slice 的 patch 在相邻 batch 中出现，减少随机打散带来的重复读盘。
+- 使用有上限的内存缓存（`cache_max_items=96`），避免 2D gating 把全量 slice 的 Layer2 logits、Layer1 语义图和图像一次性塞满内存。
+- DataLoader 启用 `persistent_workers=true`、`prefetch_factor=2`，更适合当前双 `RTX 5090 + Xeon + Windows` 的 IO/CPU 组合。
+- 启用 `early_stopping`，gate 小模型通常会比 Layer2 专家更早收敛，不建议机械跑满长周期。
+- 若想保留通用默认配置，仍可继续使用 `configs/2d/gating.yaml`。
+
+**Gating 前置条件**：
+
+- 必须先生成 Layer2 OOF：`runs/segmoe_2d_prostate/cache/oof/layer2/oof_manifest_layer2.jsonl`
+- 若该 manifest 不存在，先执行上面的 `generate_layer2_oof.py`，否则 `train_gating.py` 无法启动。
 
 **显存参考（双 RTX 5090，BF16）**：nnUNet ~12GB | SwinUNETR 25M bs=16 ~14GB | SegResNet 29M bs=32 ~8GB
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from seg_moe.data.gating_patch_dataset import SampleGroupedBatchSampler
 from seg_moe.gating.patch_gating_2d import (
     PatchConvGate2D,
     PatchGatingConfig,
@@ -173,3 +174,35 @@ class TestPatches:
         patches, positions = split_into_patches_2d(x, 64, 64)
         assert len(patches) == 4
         assert patches[0].shape == (3, 64, 64)
+
+
+class TestSampleGroupedBatchSampler:
+    def test_grouped_batches_preserve_slice_locality(self):
+        sampler = SampleGroupedBatchSampler(
+            [(0, 4), (4, 8), (8, 12)],
+            batch_size=4,
+            sample_fg_indices=[[1, 2], [5], [10]],
+            drop_last=False,
+            shuffle_samples=False,
+            shuffle_patches_within_sample=False,
+            foreground_oversample_ratio=0.0,
+        )
+        assert list(iter(sampler)) == [
+            [0, 1, 2, 3],
+            [4, 5, 6, 7],
+            [8, 9, 10, 11],
+        ]
+
+    def test_grouped_sampler_keeps_batch_size_and_biases_toward_fg(self):
+        sampler = SampleGroupedBatchSampler(
+            [(0, 6)],
+            batch_size=6,
+            sample_fg_indices=[[0, 1]],
+            drop_last=False,
+            shuffle_samples=False,
+            shuffle_patches_within_sample=False,
+            foreground_oversample_ratio=0.5,
+        )
+        batch = list(iter(sampler))[0]
+        assert len(batch) == 6
+        assert sum(idx in {0, 1} for idx in batch) >= 5

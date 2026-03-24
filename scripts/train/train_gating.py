@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from seg_moe.data.gating_patch_dataset import GatingPatchDataset
+from seg_moe.data.gating_patch_dataset import GatingPatchDataset, SampleGroupedBatchSampler
 from seg_moe.data.indexing import infer_num_classes
 from seg_moe.gating.patch_gating_2d import (
     PatchConvGate2D,
@@ -152,6 +152,13 @@ def main() -> None:
     use_image_context = bool(gcfg.get("use_image_context", False))
     use_position_channels = bool(gcfg.get("use_position_channels", False))
     use_slice_position = bool(gcfg.get("use_slice_position", False))
+    data_cfg = gating_cfg_raw.get("data", {}) or {}
+    cache_in_memory = bool(data_cfg.get("cache_in_memory", True))
+    cache_max_items = data_cfg.get("cache_max_items")
+    train_sampler_name = str(data_cfg.get("train_sampler", "random")).lower()
+    shuffle_patches_within_sample = bool(data_cfg.get("shuffle_patches_within_sample", True))
+    if train_sampler_name not in {"random", "sample_grouped"}:
+        raise ValueError(f"Unsupported train_sampler={train_sampler_name!r}")
 
     train_ds = GatingPatchDataset(
         train_rows,
@@ -161,7 +168,9 @@ def main() -> None:
         patch_size=patch_size,
         stride=stride,
         is_train=True,
-        foreground_oversample_ratio=fg_oversample,
+        foreground_oversample_ratio=fg_oversample if train_sampler_name == "random" else 0.0,
+        cache_in_memory=cache_in_memory,
+        cache_max_items=cache_max_items,
         layer1_oof_manifest_path=l1_oof_manifest_path,
         use_layer1_semantics=use_layer1_semantics,
         use_image_context=use_image_context,
@@ -176,6 +185,8 @@ def main() -> None:
         patch_size=patch_size,
         stride=stride,
         is_train=False,
+        cache_in_memory=cache_in_memory,
+        cache_max_items=cache_max_items,
         layer1_oof_manifest_path=l1_oof_manifest_path,
         use_layer1_semantics=use_layer1_semantics,
         use_image_context=use_image_context,
@@ -188,25 +199,49 @@ def main() -> None:
         f"fg_oversample={fg_oversample}"
     )
     print(f"Train patches: {len(train_ds)}, Val patches: {len(val_ds)}")
+    cache_desc = "full" if (cache_in_memory and cache_max_items is None) else (
+        f"lru[{cache_max_items}]" if cache_in_memory else "disabled"
+    )
+    print(f"Runtime | train_sampler={train_sampler_name} cache={cache_desc}")
 
     batch_size = int(tcfg.get("batch_size", 512))
     num_workers = int(tcfg.get("dataloader", {}).get("num_workers", 4))
     pin_memory = bool(tcfg.get("dataloader", {}).get("pin_memory", True))
+    persistent_workers = bool(tcfg.get("dataloader", {}).get("persistent_workers", False)) if num_workers > 0 else False
+    prefetch_factor = tcfg.get("dataloader", {}).get("prefetch_factor")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=True,
-    )
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+    }
+    if num_workers > 0 and prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = int(prefetch_factor)
+
+    if train_sampler_name == "sample_grouped":
+        train_batch_sampler = SampleGroupedBatchSampler(
+            train_ds.sample_patch_ranges,
+            batch_size=batch_size,
+            sample_fg_indices=train_ds.sample_fg_indices,
+            drop_last=True,
+            shuffle_samples=True,
+            shuffle_patches_within_sample=shuffle_patches_within_sample,
+            foreground_oversample_ratio=fg_oversample,
+        )
+        train_loader = DataLoader(train_ds, batch_sampler=train_batch_sampler, **loader_kwargs)
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            **loader_kwargs,
+        )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        **loader_kwargs,
     )
 
     gate_cfg = PatchGatingConfig(
@@ -299,6 +334,17 @@ def main() -> None:
 
     print(f"Training gating: fold={fold} device={device} epochs={epochs} bs={batch_size} lr={lr}")
     flog.info(f"Training gating: fold={fold} K={num_experts} M={num_classes} patch={patch_size}")
+    early_cfg = tcfg.get("early_stopping", {}) or {}
+    early_enabled = bool(early_cfg.get("enabled", False))
+    early_patience = int(early_cfg.get("patience", 0))
+    early_min_epochs = int(early_cfg.get("min_epochs", 0))
+    early_min_delta = float(early_cfg.get("min_delta", 0.0))
+    epochs_without_improve = 0
+    if early_enabled:
+        print(
+            f"Early stopping enabled: patience={early_patience} "
+            f"min_epochs={early_min_epochs} min_delta={early_min_delta:.6f}"
+        )
 
     for epoch in range(start_epoch, epochs + 1):
         epoch_t0 = time.time()
@@ -433,11 +479,23 @@ def main() -> None:
         }
         torch.save(ckpt, last_ckpt)
 
-        if val_dice > best_metric:
+        if val_dice > best_metric + early_min_delta:
             best_metric = val_dice
             ckpt["best_metric"] = best_metric
             torch.save(ckpt, best_ckpt)
             print(f"  New best: val_dice={val_dice:.4f}")
+            epochs_without_improve = 0
+        else:
+            epochs_without_improve += 1
+
+        if early_enabled and epoch >= early_min_epochs and epochs_without_improve >= early_patience:
+            msg = (
+                f"Early stopping at epoch {epoch}: no improvement in {epochs_without_improve} "
+                f"epochs on val_dice"
+            )
+            print(msg)
+            flog.info(msg)
+            break
 
     writer.close()
     print(f"Gating training done. Best val_dice={best_metric:.4f}")
