@@ -19,6 +19,7 @@ from tqdm import tqdm
 from seg_moe.data.dataset_2d import SegmentationDataset2D
 from seg_moe.data.indexing import infer_image_channels, infer_num_classes
 from seg_moe.models.factory_2d import build_expert, expert_name, list_experts
+from seg_moe.utils.checkpoint import load_trusted_model_state_dict
 from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl
 
@@ -85,8 +86,7 @@ def main() -> None:
         if not ckpt.exists():
             raise FileNotFoundError(f"Missing checkpoint: {ckpt}")
         model = build_expert(ec, in_channels=in_channels, num_classes=num_classes)
-        state = torch.load(ckpt, map_location="cpu", weights_only=True)
-        model.load_state_dict(state["model"], strict=True)
+        model.load_state_dict(load_trusted_model_state_dict(ckpt), strict=True)
         model.to(device).eval()
         print(f"  Loaded {ex} from {ckpt}")
         expert_models.append(model)

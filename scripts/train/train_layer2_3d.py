@@ -36,6 +36,7 @@ from seg_moe.models.factory_3d import (
     build_expert_3d, expert_name_3d, list_experts_3d, transfer_layer1_to_layer2_3d,
 )
 from seg_moe.training.losses import ce_plus_dice
+from seg_moe.utils.checkpoint import load_trusted_model_state_dict
 from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl
 from seg_moe.utils.seed import seed_everything
@@ -181,10 +182,7 @@ def main() -> None:
             l1_ckpt = run_dir / "checkpoints" / "layer1" / f"fold{fold}" / name / f"{args.which}.pt"
             if l1_ckpt.exists():
                 l1_model = build_expert_3d(ec, in_channels=base_in, num_classes=num_classes)
-                state = torch.load(l1_ckpt, map_location="cpu", weights_only=True)
-                l1_model.load_state_dict(
-                    {k.removeprefix("module."): v for k, v in state["model"].items()}, strict=False
-                )
+                l1_model.load_state_dict(load_trusted_model_state_dict(l1_ckpt), strict=False)
                 transfer_layer1_to_layer2_3d(
                     l1_model, model,
                     base_in_channels=base_in,

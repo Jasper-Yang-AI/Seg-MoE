@@ -25,6 +25,7 @@ from seg_moe.gating.patch_gating_2d import (
 from seg_moe.models.factory_2d import list_experts
 from seg_moe.training.engine import get_cosine_schedule_with_warmup
 from seg_moe.training.losses import build_loss_fn
+from seg_moe.utils.checkpoint import extract_model_state_dict, load_trusted_torch_checkpoint
 from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl
 from seg_moe.utils.seed import seed_everything
@@ -317,8 +318,8 @@ def main() -> None:
     start_epoch = 1
     best_metric = -1.0
     if args.resume and Path(args.resume).exists():
-        state = torch.load(args.resume, map_location="cpu", weights_only=True)
-        _unwrap(model).load_state_dict(state["model"])
+        state = load_trusted_torch_checkpoint(args.resume, map_location="cpu")
+        _unwrap(model).load_state_dict(extract_model_state_dict(state))
         if "opt" in state:
             opt.load_state_dict(state["opt"])
         if "epoch" in state:

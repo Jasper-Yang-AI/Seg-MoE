@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import pickle
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,6 +14,11 @@ from PIL import Image
 from seg_moe.data.indexing import infer_image_channels, infer_num_classes
 from seg_moe.data.transforms import normalize_image
 from seg_moe.models.factory_2d import build_expert, expert_name, list_experts
+from seg_moe.utils.checkpoint import (
+    extract_model_state_dict,
+    load_trusted_torch_checkpoint,
+    normalize_state_dict_keys,
+)
 from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir
 
@@ -132,18 +136,6 @@ def _parse_device(gpus: str | None) -> torch.device:
     else:
         gpu_id = 0
     return torch.device(f"cuda:{gpu_id}")
-
-
-def _normalize_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
-    return {k.removeprefix("module."): v for k, v in state_dict.items()}
-
-
-def _load_checkpoint(path: Path) -> dict[str, Any]:
-    try:
-        return torch.load(path, map_location="cpu", weights_only=True)
-    except pickle.UnpicklingError:
-        # Trusted local checkpoints fallback for torch>=2.6.
-        return torch.load(path, map_location="cpu", weights_only=False)
 
 
 def _discover_case_ids(images_ts_dir: Path) -> List[str]:
@@ -454,8 +446,8 @@ def main() -> None:
             raise FileNotFoundError(f"Missing layer1 checkpoint: {l1_ckpt}")
 
         l1 = build_expert(ec, in_channels=base_in, num_classes=num_classes)
-        s1 = _load_checkpoint(l1_ckpt)
-        l1.load_state_dict(_normalize_state_dict_keys(s1["model"]), strict=True)
+        s1 = load_trusted_torch_checkpoint(l1_ckpt, map_location="cpu")
+        l1.load_state_dict(normalize_state_dict_keys(extract_model_state_dict(s1)), strict=True)
         l1.to(device).eval()
         layer1_models[name] = l1
 
@@ -464,8 +456,8 @@ def main() -> None:
             raise FileNotFoundError(f"Missing layer2 checkpoint: {l2_ckpt}")
 
         l2 = build_expert(ec, in_channels=l2_in_channels, num_classes=num_classes)
-        s2 = _load_checkpoint(l2_ckpt)
-        l2.load_state_dict(_normalize_state_dict_keys(s2["model"]), strict=True)
+        s2 = load_trusted_torch_checkpoint(l2_ckpt, map_location="cpu")
+        l2.load_state_dict(normalize_state_dict_keys(extract_model_state_dict(s2)), strict=True)
         l2.to(device).eval()
         layer2_models[name] = l2
 

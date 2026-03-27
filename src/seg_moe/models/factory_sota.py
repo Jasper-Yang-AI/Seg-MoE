@@ -12,6 +12,8 @@ Supports:
 - nnUNet v2 (Modern CNN, extracted architecture)
 - SegResNet (3D residual encoder-decoder, from MONAI)
 """
+from __future__ import annotations
+
 import warnings as _warnings
 
 _warnings.warn(
@@ -21,12 +23,13 @@ _warnings.warn(
     DeprecationWarning,
     stacklevel=2,
 )
-from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
+
+from seg_moe.utils.checkpoint import load_trusted_model_state_dict
 
 
 def build_sota_model(
@@ -98,7 +101,7 @@ def _build_swin_unetr(
 
     if pretrained and config.get("pretrained_path"):
         try:
-            state = torch.load(config["pretrained_path"], map_location="cpu", weights_only=True)
+            state = load_trusted_model_state_dict(config["pretrained_path"])
             model.load_state_dict(state, strict=False)
             print(f"[Swin-UNetR] Loaded pretrained weights from {config['pretrained_path']}")
         except Exception as e:
@@ -182,7 +185,7 @@ def _build_segresnet(
 
     if pretrained and config.get("pretrained_path"):
         try:
-            state = torch.load(config["pretrained_path"], map_location="cpu", weights_only=True)
+            state = load_trusted_model_state_dict(config["pretrained_path"])
             model.load_state_dict(state, strict=False)
             print(f"[SegResNet] Loaded pretrained weights from {config['pretrained_path']}")
         except Exception as e:

@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 
+from seg_moe.utils.checkpoint import load_trusted_model_state_dict
+
 
 # ---------------------------------------------------------------------------
 # MONAI SegResNet 3D
@@ -126,11 +128,7 @@ def _build_nnunet_3d(in_channels: int, classes: int, params: Dict[str, Any]) -> 
 
 def _load_weights(model: nn.Module, path: str, tag: str = "") -> None:
     try:
-        state = torch.load(path, map_location="cpu", weights_only=True)
-        if "model" in state:
-            state = state["model"]
-        # Strip module. prefix
-        state = {k.removeprefix("module."): v for k, v in state.items()}
+        state = load_trusted_model_state_dict(path)
         model.load_state_dict(state, strict=False)
         print(f"[{tag}] Loaded pretrained from {path}")
     except Exception as e:

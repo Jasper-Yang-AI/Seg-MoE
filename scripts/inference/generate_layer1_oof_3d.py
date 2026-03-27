@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 from seg_moe.data.dataset_3d import SegmentationDataset3D
 from seg_moe.models.factory_3d import build_expert_3d, expert_name_3d, list_experts_3d
+from seg_moe.utils.checkpoint import load_trusted_model_state_dict
 from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl, save_jsonl
 
@@ -125,10 +126,7 @@ def main() -> None:
             if not ckpt.exists():
                 raise FileNotFoundError(f"Checkpoint not found: {ckpt}. Train layer1 first.")
             m = build_expert_3d(ec, in_channels=in_channels, num_classes=num_classes)
-            state = torch.load(ckpt, map_location="cpu", weights_only=True)
-            m.load_state_dict(
-                {k.removeprefix("module."): v for k, v in state["model"].items()}, strict=False
-            )
+            m.load_state_dict(load_trusted_model_state_dict(ckpt), strict=False)
             m.eval().to(device)
             fold_models.append(m)
             print(f"  Loaded {name} from {ckpt}")

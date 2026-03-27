@@ -21,6 +21,7 @@ from seg_moe.data.transforms import imagenet_normalize
 from seg_moe.evaluation.metrics_2d import compute_segmentation_metrics_batch
 from seg_moe.gating.patch_gating_2d import PatchConvGate2D, PatchGatingConfig
 from seg_moe.models.factory_2d import list_experts
+from seg_moe.utils.checkpoint import extract_model_state_dict, load_trusted_torch_checkpoint
 from seg_moe.utils.io import ensure_dir, load_jsonl
 from seg_moe.utils.patches import compute_patch_positions, merge_patches_2d
 
@@ -39,7 +40,7 @@ def _load_splits(dataset_cfg: dict) -> list[dict]:
 
 def _load_gating_model(ckpt_path: Path, device: torch.device) -> tuple[PatchConvGate2D, float]:
     """Load trained gating model from checkpoint."""
-    state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    state = load_trusted_torch_checkpoint(ckpt_path, map_location="cpu")
     gc = state["gate_cfg"]
     hidden_dim = int(gc["hidden_dim"])
     temperature = float(state.get("temperature", gc.get("temperature_end", 0.5)))
@@ -70,7 +71,7 @@ def _load_gating_model(ckpt_path: Path, device: torch.device) -> tuple[PatchConv
         temperature_end=float(gc.get("temperature_end", temperature)),
     )
     model = PatchConvGate2D(cfg)
-    model.load_state_dict(state["model"])
+    model.load_state_dict(extract_model_state_dict(state))
     model.to(device)
     model.eval()
     return model, temperature

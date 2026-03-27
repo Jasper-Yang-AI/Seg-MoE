@@ -28,6 +28,7 @@ from seg_moe.data.indexing import infer_image_channels, infer_num_classes
 from seg_moe.data.layer2_oof_dataset import Layer2OOFDataset
 from seg_moe.models.factory_2d import build_expert, expert_name, list_experts, transfer_layer1_to_layer2
 from seg_moe.training.engine import train_model
+from seg_moe.utils.checkpoint import load_trusted_model_state_dict
 from seg_moe.utils.config import apply_debug_overrides, load_config, merge_configs, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl
 from seg_moe.utils.seed import seed_everything
@@ -224,8 +225,7 @@ def main() -> None:
             l1_ckpt = Path(run_dir) / "checkpoints" / "layer1" / f"fold{fold}" / name / f"{args.which}.pt"
             if l1_ckpt.exists():
                 l1_model = build_expert(ec, in_channels=base_in, num_classes=num_classes)
-                state = torch.load(l1_ckpt, map_location="cpu", weights_only=True)
-                l1_model.load_state_dict(state["model"], strict=True)
+                l1_model.load_state_dict(load_trusted_model_state_dict(l1_ckpt), strict=True)
                 transfer_layer1_to_layer2(
                     l1_model, model,
                     base_in_channels=base_in,

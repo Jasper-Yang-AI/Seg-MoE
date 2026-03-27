@@ -35,6 +35,7 @@ import torch
 
 from seg_moe.data.indexing import infer_num_classes
 from seg_moe.models.factory_2d import build_expert, expert_name, list_experts
+from seg_moe.utils.checkpoint import load_trusted_torch_checkpoint
 from seg_moe.utils.config import load_config, resolve_run_dir
 
 
@@ -139,7 +140,7 @@ def main() -> None:
     print(f"  Layer   : {args.layer}")
 
     # ── Load source checkpoint ──
-    ckpt = torch.load(source, map_location="cpu", weights_only=True)
+    ckpt = load_trusted_torch_checkpoint(source, map_location="cpu")
     source_state = ckpt.get("model", ckpt.get("state_dict", ckpt))
     epoch = ckpt.get("epoch", -1)
     best_metric = ckpt.get("best_metric", -1.0)

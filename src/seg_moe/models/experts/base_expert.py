@@ -13,6 +13,8 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 
+from seg_moe.utils.checkpoint import load_trusted_model_state_dict
+
 
 class BaseExpert(nn.Module, abc.ABC):
     """Abstract base class for a segmentation expert.
@@ -55,14 +57,7 @@ class BaseExpert(nn.Module, abc.ABC):
           - Dict with 'model' key (engine.py convention)
           - DDP/DP 'module.' prefix stripping
         """
-        state = torch.load(str(path), map_location="cpu", weights_only=True)
-        if isinstance(state, dict) and "model" in state:
-            state = state["model"]
-        # strip 'module.' prefix (DataParallel / DDP compat)
-        state = {
-            (k[len("module."):] if k.startswith("module.") else k): v
-            for k, v in state.items()
-        }
+        state = load_trusted_model_state_dict(path, map_location="cpu")
         self.load_state_dict(state, strict=strict)
 
     def save_checkpoint(

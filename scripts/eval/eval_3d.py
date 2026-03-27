@@ -36,6 +36,7 @@ from seg_moe.models.factory_3d import (
     expert_name_3d,
     list_experts_3d,
 )
+from seg_moe.utils.checkpoint import extract_model_state_dict, load_trusted_torch_checkpoint
 from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl
 from seg_moe.utils.spatial import parse_3d_size
@@ -74,9 +75,8 @@ def _load_l2_model(ec, run_dir, fold, in_ch, num_classes, which, device):
             "Run scripts/train/train_layer2_3d.py before eval_3d.py."
         )
     m = build_expert_3d(ec, in_channels=in_ch, num_classes=num_classes)
-    st = torch.load(l2_ck, map_location="cpu", weights_only=True)
-    m.load_state_dict({k.removeprefix("module."): v for k, v in st["model"].items()},
-                      strict=False)
+    st = load_trusted_torch_checkpoint(l2_ck, map_location="cpu")
+    m.load_state_dict(extract_model_state_dict(st), strict=False)
     return m.eval().to(device)
 
 
@@ -91,7 +91,7 @@ def _load_gating_model(run_dir, fold, gate_cfg, expert_cfgs, num_classes, device
             "Train gating first or pass --no-gating."
         )
 
-    st = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    st = load_trusted_torch_checkpoint(ckpt_path, map_location="cpu")
     gc = st.get("gate_cfg", {})
     model_cfg = PatchGatingConfig3D(
         num_experts=K,
@@ -114,7 +114,7 @@ def _load_gating_model(run_dir, fold, gate_cfg, expert_cfgs, num_classes, device
         blend_mode=str(gc.get("blend_mode", g.get("blend_mode", "gaussian"))),
     )
     model = PatchConvGate3D(model_cfg).to(device)
-    model.load_state_dict({k.removeprefix("module."): v for k, v in st["model"].items()}, strict=True)
+    model.load_state_dict(extract_model_state_dict(st), strict=True)
     print(f"  Loaded gating from {ckpt_path}")
     return model.eval()
 

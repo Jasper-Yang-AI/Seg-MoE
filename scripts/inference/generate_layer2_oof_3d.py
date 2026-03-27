@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from seg_moe.data.layer2_oof_dataset_3d import Layer2OOFDataset3D
 from seg_moe.models.factory_3d import build_expert_3d, expert_name_3d, list_experts_3d
+from seg_moe.utils.checkpoint import load_trusted_model_state_dict
 from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl, save_jsonl
 
@@ -124,11 +125,7 @@ def main() -> None:
                 )
 
             model = build_expert_3d(expert_cfg, in_channels=in_channels, num_classes=num_classes)
-            state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-            model.load_state_dict(
-                {k.removeprefix("module."): v for k, v in state["model"].items()},
-                strict=False,
-            )
+            model.load_state_dict(load_trusted_model_state_dict(ckpt_path), strict=False)
             model.eval().to(device)
             fold_models.append(model)
             print(f"  Loaded L2 {name} from {ckpt_path}")

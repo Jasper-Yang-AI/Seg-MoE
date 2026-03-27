@@ -32,6 +32,7 @@ from seg_moe.data.dataset_3d import SegmentationDataset3D
 from seg_moe.evaluation.metrics_3d import compute_dice_batch_3d
 from seg_moe.models.factory_3d import build_expert_3d, expert_name_3d, list_experts_3d
 from seg_moe.training.losses import build_loss_fn, ce_plus_dice
+from seg_moe.utils.checkpoint import extract_model_state_dict, load_trusted_torch_checkpoint
 from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl, save_jsonl
 from seg_moe.utils.seed import seed_everything
@@ -173,8 +174,8 @@ def train_model_3d(
 
     # Resume
     if resume_from and Path(resume_from).exists():
-        ckpt = torch.load(resume_from, map_location="cpu", weights_only=True)
-        _unwrap(model).load_state_dict({k.removeprefix("module."): v for k, v in ckpt["model"].items()})
+        ckpt = load_trusted_torch_checkpoint(resume_from, map_location="cpu")
+        _unwrap(model).load_state_dict(extract_model_state_dict(ckpt))
         if "opt" in ckpt:
             optimizer.load_state_dict(ckpt["opt"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1

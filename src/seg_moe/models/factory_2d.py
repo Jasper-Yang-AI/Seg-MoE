@@ -5,6 +5,8 @@ from typing import Any, Dict, List
 import torch
 import torch.nn as nn
 
+from seg_moe.utils.checkpoint import load_trusted_model_state_dict
+
 
 # ---------------------------------------------------------------------------
 #  MONAI 2D model builders
@@ -41,7 +43,7 @@ def _build_monai_swin_unetr_2d(in_channels: int, classes: int, params: Dict[str,
 
     if params.get("pretrained_path"):
         try:
-            state = torch.load(params["pretrained_path"], map_location="cpu", weights_only=True)
+            state = load_trusted_model_state_dict(params["pretrained_path"])
             model.load_state_dict(state, strict=False)
             print(f"[Swin-UNetR-2D] Loaded pretrained weights from {params['pretrained_path']}")
         except Exception as e:
@@ -69,7 +71,7 @@ def _build_monai_segresnet_2d(in_channels: int, classes: int, params: Dict[str, 
 
     if params.get("pretrained_path"):
         try:
-            state = torch.load(params["pretrained_path"], map_location="cpu", weights_only=True)
+            state = load_trusted_model_state_dict(params["pretrained_path"])
             model.load_state_dict(state, strict=False)
             print(f"[SegResNet-2D] Loaded pretrained weights from {params['pretrained_path']}")
         except Exception as e:
@@ -108,7 +110,7 @@ def _build_monai_segresnet_ds_2d(in_channels: int, classes: int, params: Dict[st
 
     if params.get("pretrained_path"):
         try:
-            state = torch.load(params["pretrained_path"], map_location="cpu", weights_only=True)
+            state = load_trusted_model_state_dict(params["pretrained_path"])
             model.load_state_dict(state, strict=False)
             print(f"[SegResNetDS-2D] Loaded pretrained weights from {params['pretrained_path']}")
         except Exception as e:
@@ -153,14 +155,9 @@ def _build_nnunet_2d(in_channels: int, classes: int, params: Dict[str, Any]) -> 
     pretrained_path = params.get("pretrained_path")
     if pretrained_path:
         try:
-            state = torch.load(pretrained_path, map_location="cpu", weights_only=True)
-            # Seg-MoE checkpoint format: {"model": state_dict, ...}
-            if "model" in state:
-                wrapper.load_state_dict(state["model"], strict=False)
-                print(f"[nnUNet-2D] Loaded pretrained weights from {pretrained_path}")
-            else:
-                wrapper.load_state_dict(state, strict=False)
-                print(f"[nnUNet-2D] Loaded raw state_dict from {pretrained_path}")
+            state = load_trusted_model_state_dict(pretrained_path)
+            wrapper.load_state_dict(state, strict=False)
+            print(f"[nnUNet-2D] Loaded pretrained weights from {pretrained_path}")
         except Exception as e:
             print(f"[nnUNet-2D] Warning: Could not load pretrained weights: {e}")
 

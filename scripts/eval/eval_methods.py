@@ -56,6 +56,7 @@ from seg_moe.data.indexing import infer_image_channels, infer_num_classes
 from seg_moe.data.oof import load_oof_manifest, get_oof_prob_path
 from seg_moe.evaluation.metrics_2d import compute_segmentation_metrics_batch
 from seg_moe.models.factory_2d import build_expert, expert_name, list_experts
+from seg_moe.utils.checkpoint import load_trusted_model_state_dict
 from seg_moe.utils.config import load_config, resolve_run_dir
 from seg_moe.utils.io import ensure_dir, load_jsonl, save_json
 
@@ -437,8 +438,7 @@ def main() -> None:
                 print(f"  skip {ex} (no checkpoint)")
                 continue
             model = build_expert(ec, in_channels=in_channels, num_classes=num_classes)
-            state = torch.load(ckpt, map_location="cpu", weights_only=True)
-            model.load_state_dict(state["model"], strict=True)
+            model.load_state_dict(load_trusted_model_state_dict(ckpt), strict=True)
             model.to(device)
 
             method = f"L1_{ex}"
@@ -481,8 +481,7 @@ def main() -> None:
                     print(f"  skip L2_{ex} (no checkpoint)")
                     continue
                 model = build_expert(ec, in_channels=l2_in_channels, num_classes=num_classes)
-                state = torch.load(ckpt, map_location="cpu", weights_only=True)
-                model.load_state_dict(state["model"], strict=True)
+                model.load_state_dict(load_trusted_model_state_dict(ckpt), strict=True)
                 model.to(device)
 
                 method = f"L2_{ex}"

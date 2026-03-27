@@ -26,6 +26,7 @@ from typing import Any, Dict, List
 import torch
 
 from seg_moe.models.factory_3d import build_expert_3d, expert_name_3d, list_experts_3d
+from seg_moe.utils.checkpoint import load_trusted_torch_checkpoint
 from seg_moe.utils.config import load_config, resolve_run_dir
 
 
@@ -79,7 +80,7 @@ def main() -> None:
     print(f"  Expert  : {swin_name}")
     print(f"  Fold    : {args.fold}")
 
-    ckpt = torch.load(source, map_location="cpu", weights_only=True)
+    ckpt = load_trusted_torch_checkpoint(source, map_location="cpu")
     source_state = ckpt.get("model", ckpt.get("state_dict", ckpt))
     epoch = ckpt.get("epoch", -1)
     best_metric = ckpt.get("best_metric", -1.0)
