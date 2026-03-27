@@ -31,6 +31,13 @@ Usage:
         --training configs/2d/training.yaml \\
         --models configs/2d/models.yaml \\
         --fold 0 --gpus 0
+
+    # Overall cross-validation evaluation across all val folds
+    python scripts/eval/eval_methods.py \\
+        --exp configs/2d/exp/exp_msd_task03_liver.yaml \\
+        --training configs/2d/training.yaml \\
+        --models configs/2d/models.yaml \\
+        --fold all --gpus 0
 """
 from __future__ import annotations
 
@@ -75,6 +82,18 @@ def _load_splits(dataset_cfg: dict) -> list[dict]:
     else:
         path = splits_dir / "splits_5fold.jsonl"
     return load_jsonl(path)
+
+
+def _find_val_folds(rows: list[dict]) -> list[int]:
+    folds = set()
+    for row in rows:
+        split = str(row.get("split", ""))
+        if split.startswith("val_fold"):
+            try:
+                folds.add(int(split.replace("val_fold", "")))
+            except ValueError:
+                pass
+    return sorted(folds)
 
 
 def _ckpt(run_dir: Path, layer: str, fold: int, ex: str, which: str = "best") -> Path:
@@ -296,6 +315,21 @@ def _eval_gating_from_cache(
     return data
 
 
+def _tag_per_sample_records(
+    per_sample: List[Dict[str, Any]],
+    fold: int,
+    split: str,
+) -> List[Dict[str, Any]]:
+    tagged: List[Dict[str, Any]] = []
+    for record in per_sample:
+        out = dict(record)
+        out["eval_fold"] = int(fold)
+        out["eval_split"] = str(split)
+        out["sample_key"] = f"fold{fold}:{out.get('sample_id')}"
+        tagged.append(out)
+    return tagged
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Phase E: Statistical significance testing
 # ═══════════════════════════════════════════════════════════════════════
@@ -314,10 +348,11 @@ def _wilcoxon_pairwise(
     from scipy.stats import wilcoxon
 
     methods = sorted(per_sample_df["method"].unique())
+    sample_id_col = "sample_key" if "sample_key" in per_sample_df.columns else "sample_id"
     rows = []
     for a, b in itertools.combinations(methods, 2):
-        da = per_sample_df[per_sample_df["method"] == a].set_index("sample_id")[metric]
-        db = per_sample_df[per_sample_df["method"] == b].set_index("sample_id")[metric]
+        da = per_sample_df[per_sample_df["method"] == a].set_index(sample_id_col)[metric]
+        db = per_sample_df[per_sample_df["method"] == b].set_index(sample_id_col)[metric]
         common = da.index.intersection(db.index)
         if len(common) < 10:
             continue
@@ -356,12 +391,258 @@ def _aggregate(per_sample: List[Dict[str, Any]], method: str, dataset: str, spli
     if not per_sample:
         return {}
     row: Dict[str, Any] = {"dataset": dataset, "split": split, "method": method}
-    all_keys = [k for k in per_sample[0].keys() if k != "sample_id"]
+    excluded = {"sample_id", "sample_key", "eval_fold", "eval_split", "method"}
+    all_keys = [k for k in per_sample[0].keys() if k not in excluded]
     for k in all_keys:
         vals = [m.get(k, np.nan) for m in per_sample]
         if isinstance(vals[0], (int, float, np.floating, np.integer)):
             row[k] = float(np.nanmean(vals))
     return row
+
+
+def _aggregate_overall(
+    per_sample: List[Dict[str, Any]],
+    dataset: str,
+    split: str,
+) -> List[Dict[str, Any]]:
+    methods = sorted({str(r.get("method")) for r in per_sample if r.get("method")})
+    rows: List[Dict[str, Any]] = []
+    for method in methods:
+        method_rows = [r for r in per_sample if r.get("method") == method]
+        agg = _aggregate(method_rows, method, dataset, split)
+        if agg:
+            agg["scope"] = "overall"
+            rows.append(agg)
+    return rows
+
+
+def _evaluate_fold(
+    *,
+    exp_cfg: dict,
+    dataset_cfg: dict,
+    models_cfg: dict,
+    run_dir: Path,
+    rows: list[dict],
+    fold: int,
+    which: str,
+    device: torch.device,
+    skip_live_inference: bool,
+    add_uncertainty: bool,
+    allow_missing_gating_cache: bool,
+    prefer_test: bool,
+    fit_rows_override: Optional[list[dict]] = None,
+) -> tuple[str, list[dict], list[dict]]:
+    dataset_name = str(dataset_cfg["name"])
+    num_classes = infer_num_classes(dataset_cfg)
+    in_channels = infer_image_channels(dataset_cfg)
+    expert_cfgs = list_experts(models_cfg)
+    all_expert_names = [expert_name(ec) for ec in expert_cfgs]
+    K = len(expert_cfgs)
+
+    split_candidates = ["test", f"val_fold{fold}"] if prefer_test else [f"val_fold{fold}"]
+    split = next(
+        (s for s in split_candidates if any(r.get("split") == s for r in rows)),
+        f"val_fold{fold}",
+    )
+    eval_rows = [r for r in rows if r.get("split") == split]
+    if fit_rows_override is not None:
+        fit_rows = list(fit_rows_override)
+    else:
+        fit_rows = [r for r in rows if r.get("split") == f"val_fold{fold}"]
+
+    print("\n" + "=" * 70)
+    print(f"Evaluating fold={fold} split={split} eval_samples={len(eval_rows)} fit_samples={len(fit_rows)}")
+    print("=" * 70)
+
+    summary_records: List[Dict[str, Any]] = []
+    all_per_sample: List[Dict[str, Any]] = []
+
+    def _record_method(method: str, per_sample_raw: List[Dict[str, Any]]) -> None:
+        tagged = _tag_per_sample_records(per_sample_raw, fold=fold, split=split)
+        for m in tagged:
+            m["method"] = method
+        all_per_sample.extend(tagged)
+        agg = _aggregate(tagged, method, dataset_name, split)
+        if agg:
+            agg["eval_fold"] = int(fold)
+            agg["eval_split"] = split
+            agg["scope"] = "fold"
+            summary_records.append(agg)
+
+    # Phase A: Layer1 single experts
+    if not skip_live_inference:
+        ds = SegmentationDataset2D(eval_rows, dataset_cfg, augs_cfg=None, is_train=False)
+        dl = DataLoader(ds, batch_size=1, shuffle=False)
+
+        print("=" * 60)
+        print("Phase A: Layer1 single experts")
+        print("=" * 60)
+        for ec in expert_cfgs:
+            ex = expert_name(ec)
+            ckpt = _ckpt(run_dir, "layer1", fold, ex, which=which)
+            if not ckpt.exists():
+                print(f"  skip {ex} (no checkpoint)")
+                continue
+            model = build_expert(ec, in_channels=in_channels, num_classes=num_classes)
+            model.load_state_dict(load_trusted_model_state_dict(ckpt), strict=True)
+            model.to(device)
+
+            method = f"L1_{ex}"
+            ps = _eval_single_expert(model, dl, num_classes, device)
+            _record_method(method, ps)
+            agg = summary_records[-1] if summary_records and summary_records[-1]["method"] == method else {}
+            print(f"  {method}: Dice={agg.get('dice_mean', 0):.4f}  "
+                  f"HD95={agg.get('hd95_mean', float('nan')):.2f}  "
+                  f"NSD={agg.get('nsd_mean', 0):.4f}")
+            del model
+            torch.cuda.empty_cache()
+
+    # Phase B: Layer2 single experts
+    l1_manifest = _resolve_manifest(exp_cfg, "oof_manifest_path", "oof/layer1/oof_manifest.jsonl")
+    if l1_manifest.exists() and not skip_live_inference:
+        try:
+            from seg_moe.data.layer2_oof_dataset import Layer2OOFDataset
+
+            extra_uncertainty_ch = (1 + num_classes) if add_uncertainty else 0
+            l2_in_channels = in_channels + K * num_classes + extra_uncertainty_ch
+
+            l2_ds = Layer2OOFDataset(
+                eval_rows, dataset_cfg, l1_manifest,
+                expected_num_experts=K, augs_cfg=None, is_train=False,
+                add_uncertainty=add_uncertainty,
+            )
+            l2_dl = DataLoader(l2_ds, batch_size=1, shuffle=False)
+
+            print("=" * 60)
+            print("Phase B: Layer2 single experts")
+            print("=" * 60)
+            for ec in expert_cfgs:
+                ex = expert_name(ec)
+                ckpt = _ckpt(run_dir, "layer2", fold, ex, which=which)
+                if not ckpt.exists():
+                    print(f"  skip L2_{ex} (no checkpoint)")
+                    continue
+                model = build_expert(ec, in_channels=l2_in_channels, num_classes=num_classes)
+                model.load_state_dict(load_trusted_model_state_dict(ckpt), strict=True)
+                model.to(device)
+
+                method = f"L2_{ex}"
+                ps = _eval_single_expert(model, l2_dl, num_classes, device)
+                _record_method(method, ps)
+                agg = summary_records[-1] if summary_records and summary_records[-1]["method"] == method else {}
+                print(f"  {method}: Dice={agg.get('dice_mean', 0):.4f}  "
+                      f"HD95={agg.get('hd95_mean', float('nan')):.2f}  "
+                      f"NSD={agg.get('nsd_mean', 0):.4f}")
+                del model
+                torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"  Phase B skipped: {e}")
+
+    # Phase C: Ensembles + Combiners on OOF probs
+    oof_configs = []
+
+    l1_manifest = _resolve_manifest(exp_cfg, "oof_manifest_path", "oof/layer1/oof_manifest.jsonl")
+    if l1_manifest.exists():
+        oof_configs.append(("L1", l1_manifest))
+
+    l2_manifest = _resolve_manifest(exp_cfg, "l2_oof_manifest_path", "oof/layer2/oof_manifest_layer2.jsonl")
+    if l2_manifest.exists():
+        oof_configs.append(("L2", l2_manifest))
+
+    for layer_tag, manifest_path in oof_configs:
+        oof_map = load_oof_manifest(manifest_path)
+
+        has_probs = any(
+            str(s["id"]) in oof_map and get_oof_prob_path(oof_map, str(s["id"])).exists()
+            for s in eval_rows
+        )
+        has_fit_probs = any(
+            str(s["id"]) in oof_map and get_oof_prob_path(oof_map, str(s["id"])).exists()
+            for s in fit_rows
+        )
+        if not has_probs:
+            continue
+
+        print("=" * 60)
+        print(f"Phase C: Ensembles + Combiners on {layer_tag} OOF")
+        print("=" * 60)
+
+        method = f"{layer_tag}_mean"
+        ps = _eval_mean_ensemble_from_oof(eval_rows, oof_map, dataset_cfg, num_classes)
+        _record_method(method, ps)
+        agg = summary_records[-1] if summary_records and summary_records[-1]["method"] == method else {}
+        print(f"  {method}: Dice={agg.get('dice_mean', 0):.4f}  "
+              f"HD95={agg.get('hd95_mean', float('nan')):.2f}  "
+              f"NSD={agg.get('nsd_mean', 0):.4f}")
+
+        mv = MajorityVotingCombiner()
+        mv.fit(np.zeros((1, K, num_classes)), np.zeros(1, dtype=np.int64), num_classes)
+        method = f"{layer_tag}_majority"
+        ps = _eval_combiner_per_sample(mv.predict, eval_rows, oof_map, dataset_cfg, num_classes)
+        _record_method(method, ps)
+        agg = summary_records[-1] if summary_records and summary_records[-1]["method"] == method else {}
+        print(f"  {method}: Dice={agg.get('dice_mean', 0):.4f}  "
+              f"HD95={agg.get('hd95_mean', float('nan')):.2f}  "
+              f"NSD={agg.get('nsd_mean', 0):.4f}")
+
+        if not has_fit_probs:
+            print(f"  [skip learned combiners - no fit probs for {layer_tag}]")
+            continue
+
+        print(f"  Collecting {layer_tag} fit data...")
+        X_fit, y_fit = _collect_oof_flat(fit_rows, oof_map, dataset_cfg)
+        if X_fit.size == 0:
+            print("  [skip - no fit data]")
+            continue
+
+        combiner_specs = [
+            (f"{layer_tag}_ole", OLECombiner(mode="lsq_bounded")),
+            (f"{layer_tag}_dt", DecisionTemplateCombiner()),
+            (f"{layer_tag}_we_clpso", WECLPSOCombiner(n_particles=30, iters=100, seed=42)),
+        ]
+
+        for method, comb in combiner_specs:
+            print(f"  Fitting {method}...")
+            comb.fit(X_fit, y_fit, num_classes=num_classes)
+            ps = _eval_combiner_per_sample(
+                comb.predict, eval_rows, oof_map, dataset_cfg, num_classes,
+            )
+            _record_method(method, ps)
+            agg = summary_records[-1] if summary_records and summary_records[-1]["method"] == method else {}
+            print(f"  {method}: Dice={agg.get('dice_mean', 0):.4f}  "
+                  f"HD95={agg.get('hd95_mean', float('nan')):.2f}  "
+                  f"NSD={agg.get('nsd_mean', 0):.4f}")
+
+    # Phase D: Gating fusion
+    gating_data = _eval_gating_from_cache(run_dir, fold, split)
+    if gating_data is not None:
+        print("=" * 60)
+        print("Phase D: Gating fusion (cached)")
+        print("=" * 60)
+        method = "gating"
+        gating_ps = gating_data.get("per_sample", [])
+        _record_method(method, gating_ps)
+        agg = summary_records[-1] if summary_records and summary_records[-1]["method"] == method else {}
+        print(f"  gating: Dice={agg.get('dice_mean', gating_data.get('mean_dice', 0.0)):.4f}")
+    else:
+        gating_ckpt = run_dir / "checkpoints" / "gating" / f"fold{fold}" / "best.pt"
+        if gating_ckpt.exists() and not allow_missing_gating_cache:
+            raise FileNotFoundError(
+                "Gating checkpoint exists but cached inference results are missing. "
+                "Run scripts/inference/gating_inference.py before eval_methods.py, "
+                "or pass --allow-missing-gating-cache to skip gating."
+            )
+        print("\n[Phase D skipped: no gating results cached]")
+
+    weights_out: Dict[str, Any] = {
+        "dataset": dataset_name,
+        "fold": int(fold),
+        "split": split,
+        "experts": all_expert_names,
+        "num_classes": num_classes,
+    }
+    _ = weights_out
+    return split, summary_records, all_per_sample
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -373,7 +654,8 @@ def main() -> None:
     ap.add_argument("--exp", required=True)
     ap.add_argument("--training", required=True)
     ap.add_argument("--models", required=True)
-    ap.add_argument("--fold", type=int, default=0)
+    ap.add_argument("--fold", default="0",
+                    help="Fold index (for example 0) or 'all' for overall CV evaluation")
     ap.add_argument("--which", choices=["best", "last"], default="best")
     ap.add_argument("--gpus", type=str, default=None)
     ap.add_argument("--skip-live-inference", action="store_true",
@@ -394,22 +676,24 @@ def main() -> None:
     )
 
     rows = _load_splits(dataset_cfg)
-    fold = int(args.fold)
-    split_candidates = ["test", f"val_fold{fold}"]
-    split = next(
-        (s for s in split_candidates if any(r.get("split") == s for r in rows)),
-        f"val_fold{fold}",
-    )
-    eval_rows = [r for r in rows if r.get("split") == split]
-    fit_split = f"val_fold{fold}"
-    fit_rows = [r for r in rows if r.get("split") == fit_split]
+    available_val_folds = _find_val_folds(rows)
+    if not available_val_folds:
+        raise ValueError("No validation folds found in dataset splits.")
 
-    num_classes = infer_num_classes(dataset_cfg)
-    in_channels = infer_image_channels(dataset_cfg)
-    expert_cfgs = list_experts(models_cfg)
-    all_expert_names = [expert_name(ec) for ec in expert_cfgs]
-    K = len(expert_cfgs)
-    add_uncertainty = not args.no_uncertainty
+    fold_arg = str(args.fold).strip().lower()
+    run_all_folds = fold_arg == "all"
+    if run_all_folds:
+        target_folds = available_val_folds
+        output_tag = "all_val_folds"
+        display_split = "all_val_folds"
+        print(f"Running overall CV evaluation across folds: {target_folds}")
+    else:
+        fold = int(fold_arg)
+        if fold not in available_val_folds and not any(r.get("split") == "test" for r in rows):
+            raise ValueError(f"Requested fold {fold} not found. Available val folds: {available_val_folds}")
+        target_folds = [fold]
+        output_tag = ""
+        display_split = ""
 
     # Device
     if args.gpus:
@@ -420,8 +704,104 @@ def main() -> None:
     else:
         device = torch.device("cpu")
 
-    summary_records: List[Dict[str, Any]] = []
     all_per_sample: List[Dict[str, Any]] = []
+    fold_summary_records: List[Dict[str, Any]] = []
+    summary_records: List[Dict[str, Any]] = []
+    final_split = None
+    for fold in target_folds:
+        fit_rows_override = None
+        if run_all_folds:
+            fit_rows_override = [
+                r for r in rows
+                if str(r.get("split", "")).startswith("val_fold") and r.get("split") != f"val_fold{fold}"
+            ]
+
+        fold_split, fold_summary, fold_per_sample = _evaluate_fold(
+            exp_cfg=exp_cfg,
+            dataset_cfg=dataset_cfg,
+            models_cfg=models_cfg,
+            run_dir=run_dir,
+            rows=rows,
+            fold=fold,
+            which=args.which,
+            device=device,
+            skip_live_inference=bool(args.skip_live_inference),
+            add_uncertainty=not args.no_uncertainty,
+            allow_missing_gating_cache=bool(args.allow_missing_gating_cache),
+            prefer_test=not run_all_folds,
+            fit_rows_override=fit_rows_override,
+        )
+        final_split = fold_split
+        fold_summary_records.extend(fold_summary)
+        all_per_sample.extend(fold_per_sample)
+
+    if run_all_folds:
+        summary_records = _aggregate_overall(all_per_sample, dataset_name, display_split)
+    else:
+        output_tag = f"fold{target_folds[0]}_{final_split}"
+        display_split = str(final_split)
+        summary_records = fold_summary_records
+
+    print("=" * 60)
+    print("Phase E: Statistical significance (Wilcoxon)")
+    print("=" * 60)
+
+    ps_df = pd.DataFrame(all_per_sample) if all_per_sample else pd.DataFrame()
+    if not ps_df.empty:
+        sig_df = _wilcoxon_pairwise(ps_df, metric="dice_mean")
+        if not sig_df.empty:
+            sig_path = results_dir / f"significance_{dataset_name}_{output_tag}.csv"
+            sig_df.to_csv(sig_path, index=False)
+            print(f"  Wrote {sig_path} ({len(sig_df)} pairs tested)")
+            sig_pairs = sig_df[sig_df["significant"]]
+            if not sig_pairs.empty:
+                for _, r in sig_pairs.iterrows():
+                    print(f"    {r['method_a']} vs {r['method_b']}: p={r['p_value']:.4e} *")
+        else:
+            print("  No method pairs with enough samples for testing")
+
+    if not ps_df.empty:
+        ps_path = results_dir / f"metrics_per_sample_{dataset_name}_{output_tag}.csv"
+        ps_df.to_csv(ps_path, index=False)
+        print(f"\nWrote per-sample: {ps_path}")
+
+    if summary_records:
+        sum_df = pd.DataFrame(summary_records)
+        sum_path = results_dir / f"metrics_{dataset_name}_{output_tag}.csv"
+        sum_df.to_csv(sum_path, index=False)
+        print(f"Wrote summary:    {sum_path}")
+
+        if run_all_folds and fold_summary_records:
+            fold_df = pd.DataFrame(fold_summary_records)
+            fold_path = results_dir / f"metrics_by_fold_{dataset_name}_{output_tag}.csv"
+            fold_df.to_csv(fold_path, index=False)
+            print(f"Wrote by-fold:    {fold_path}")
+
+        tables_dir = ensure_dir(Path(
+            exp_cfg.get("output", {}).get("tables_dir",
+                f"runs/{exp_cfg['exp_name']}/tables").replace("${exp_name}", exp_cfg["exp_name"])
+        ))
+        sum_df.to_csv(tables_dir / "metrics.csv", index=False)
+        if not ps_df.empty:
+            ps_df.to_csv(tables_dir / "metrics_per_sample.csv", index=False)
+
+        print("\n" + "=" * 70)
+        print("SUMMARY")
+        print("=" * 70)
+        cols = ["method", "dice_mean", "hd95_mean", "nsd_mean", "sens_mean", "prec_mean"]
+        display_cols = [c for c in cols if c in sum_df.columns]
+        print(sum_df[display_cols].to_string(index=False, float_format="%.4f"))
+
+    weights_out: Dict[str, Any] = {
+        "dataset": dataset_name,
+        "fold": "all" if run_all_folds else target_folds[0],
+        "folds_evaluated": target_folds,
+        "split": display_split,
+        "num_classes": infer_num_classes(dataset_cfg),
+        "experts": [expert_name(ec) for ec in list_experts(models_cfg)],
+    }
+    save_json(results_dir / f"{dataset_name}_{output_tag}_weights.json", weights_out)
+    return
 
     # ── Phase A: Layer1 single experts ─────────────────────────────
     if not args.skip_live_inference:
