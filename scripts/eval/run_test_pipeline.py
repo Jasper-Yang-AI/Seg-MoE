@@ -81,6 +81,7 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
     _extend_opt(eval_cmd, "--gpus", args.gpus)
     _extend_flag(eval_cmd, "--skip-live-inference", bool(args.skip_live_inference))
     _extend_flag(eval_cmd, "--no-uncertainty", bool(args.no_uncertainty))
+    _extend_flag(eval_cmd, "--skip-learned-combiners", bool(args.skip_learned_combiners))
     _extend_flag(
         eval_cmd,
         "--allow-missing-gating-cache",
@@ -124,6 +125,7 @@ def main() -> None:
     ap.add_argument("--skip-existing", action="store_true")
     ap.add_argument("--skip-live-inference", action="store_true")
     ap.add_argument("--no-uncertainty", action="store_true")
+    ap.add_argument("--skip-learned-combiners", action="store_true")
     ap.add_argument("--allow-missing-gating-cache", action="store_true")
     args = ap.parse_args()
 

@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import shutil
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -129,15 +130,53 @@ def _parse_spacing(meta: dict) -> Optional[tuple[float, float]]:
 
 def _load_probs_from_cache(cache_path: Path) -> np.ndarray:
     """Load [K,M,H,W] probabilities from logits-first cache."""
-    data = np.load(cache_path)
-    if "logits" in data:
-        logits = data["logits"].astype(np.float32)
-        logits = logits - logits.max(axis=1, keepdims=True)
-        exp_logits = np.exp(logits)
-        return exp_logits / (exp_logits.sum(axis=1, keepdims=True) + 1e-8)
-    if "probs" in data:
-        return data["probs"].astype(np.float32)
+    with np.load(cache_path) as data:
+        if "logits" in data:
+            logits = data["logits"].astype(np.float32)
+            logits = logits - logits.max(axis=1, keepdims=True)
+            exp_logits = np.exp(logits)
+            return exp_logits / (exp_logits.sum(axis=1, keepdims=True) + 1e-8)
+        if "probs" in data:
+            return data["probs"].astype(np.float32)
     raise KeyError(f"Cache file missing 'logits'/'probs': {cache_path}")
+
+
+def _load_mask_array(mask_path: str | Path, label_map: dict[int, int]) -> np.ndarray:
+    from PIL import Image
+
+    mask = np.array(Image.open(mask_path).convert("L"), dtype=np.uint8)
+    if label_map:
+        mapped = mask.copy()
+        for k, v in label_map.items():
+            mapped[mask == k] = v
+        mask = mapped
+    return mask.astype(np.int64)
+
+
+class _FlatOOFChunkSource:
+    """Re-iterable flattened OOF stream used for low-memory combiner fitting."""
+
+    def __init__(self, rows: list[dict], oof_map: dict, dataset_cfg: dict):
+        self.rows = list(rows)
+        self.oof_map = oof_map
+        self.label_map = {
+            int(k): int(v) for k, v in dataset_cfg["task"].get("label_map", {}).items()
+        }
+
+    def __iter__(self):
+        for sample in self.rows:
+            sid = str(sample["id"])
+            if sid not in self.oof_map:
+                continue
+            prob_path = get_oof_prob_path(self.oof_map, sid)
+            if not prob_path.exists():
+                continue
+
+            probs = _load_probs_from_cache(prob_path)  # [K,M,H,W]
+            _, _, height, width = probs.shape
+            mask = _load_mask_array(sample["mask_path"], self.label_map)
+            flat_probs = probs.transpose(2, 3, 0, 1).reshape(height * width, probs.shape[0], probs.shape[1])
+            yield flat_probs, mask.reshape(-1)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -180,32 +219,10 @@ def _collect_oof_flat(
 
     Returns X: [N, K, M], y: [N]
     """
-    label_map = {
-        int(k): int(v) for k, v in dataset_cfg["task"].get("label_map", {}).items()
-    }
-    from PIL import Image
-
     X_list, y_list = [], []
-    for s in rows:
-        sid = str(s["id"])
-        if sid not in oof_map:
-            continue
-        prob_path = get_oof_prob_path(oof_map, sid)
-        if not prob_path.exists():
-            continue
-        probs = _load_probs_from_cache(prob_path)  # [K,M,H,W]
-        K, M, H, W = probs.shape
-        # Load mask
-        mask = np.array(Image.open(s["mask_path"]).convert("L"), dtype=np.uint8)
-        if label_map:
-            mapped = mask.copy()
-            for k, v in label_map.items():
-                mapped[mask == k] = v
-            mask = mapped
-        # Flatten
-        pf = probs.transpose(2, 3, 0, 1).reshape(H * W, K, M)  # [HW, K, M]
-        X_list.append(pf)
-        y_list.append(mask.reshape(-1).astype(np.int64))
+    for probs_flat, target_flat in _FlatOOFChunkSource(rows, oof_map, dataset_cfg):
+        X_list.append(probs_flat)
+        y_list.append(target_flat)
 
     if not X_list:
         return np.empty((0,)), np.empty((0,))
@@ -223,8 +240,6 @@ def _eval_combiner_per_sample(
     label_map = {
         int(k): int(v) for k, v in dataset_cfg["task"].get("label_map", {}).items()
     }
-    from PIL import Image
-
     per_sample: List[Dict[str, Any]] = []
     for s in eval_rows:
         sid = str(s["id"])
@@ -237,12 +252,7 @@ def _eval_combiner_per_sample(
         K, M, H, W = probs.shape
 
         # Load mask
-        mask = np.array(Image.open(s["mask_path"]).convert("L"), dtype=np.uint8)
-        if label_map:
-            mapped = mask.copy()
-            for k, v in label_map.items():
-                mapped[mask == k] = v
-            mask = mapped.astype(np.int64)
+        mask = _load_mask_array(s["mask_path"], label_map)
 
         # Flatten → predict → reshape
         pf = probs.transpose(2, 3, 0, 1).reshape(H * W, K, M)
@@ -275,8 +285,6 @@ def _eval_mean_ensemble_from_oof(
     label_map = {
         int(k): int(v) for k, v in dataset_cfg["task"].get("label_map", {}).items()
     }
-    from PIL import Image
-
     per_sample: List[Dict[str, Any]] = []
     for s in eval_rows:
         sid = str(s["id"])
@@ -288,12 +296,7 @@ def _eval_mean_ensemble_from_oof(
         probs = _load_probs_from_cache(prob_path)  # [K,M,H,W]
         fused = probs.mean(axis=0)  # [M,H,W]
 
-        mask = np.array(Image.open(s["mask_path"]).convert("L"), dtype=np.uint8)
-        if label_map:
-            mapped = mask.copy()
-            for k, v in label_map.items():
-                mapped[mask == k] = v
-            mask = mapped.astype(np.int64)
+        mask = _load_mask_array(s["mask_path"], label_map)
 
         probs_t = torch.from_numpy(fused).unsqueeze(0).float()
         mask_t = torch.from_numpy(mask).unsqueeze(0)
@@ -420,6 +423,51 @@ def _aggregate_overall(
     return rows
 
 
+def _aggregate_overall_df(
+    per_sample_df: pd.DataFrame,
+    dataset: str,
+    split: str,
+) -> List[Dict[str, Any]]:
+    if per_sample_df.empty or "method" not in per_sample_df.columns:
+        return []
+
+    excluded = {"sample_id", "sample_key", "eval_fold", "eval_split", "method"}
+    numeric_cols = [
+        c for c in per_sample_df.columns
+        if c not in excluded and pd.api.types.is_numeric_dtype(per_sample_df[c])
+    ]
+    if not numeric_cols:
+        return []
+
+    grouped = (
+        per_sample_df.groupby("method", sort=True)[numeric_cols]
+        .mean(numeric_only=True)
+        .reset_index()
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for record in grouped.to_dict(orient="records"):
+        method = str(record.pop("method"))
+        row: Dict[str, Any] = {
+            "dataset": dataset,
+            "split": split,
+            "method": method,
+            "scope": "overall",
+        }
+        for key, value in record.items():
+            row[key] = float(value) if pd.notna(value) else np.nan
+        rows.append(row)
+    return rows
+
+
+def _append_records_csv(records: List[Dict[str, Any]], out_path: Path) -> bool:
+    if not records:
+        return False
+    df = pd.DataFrame(records)
+    df.to_csv(out_path, mode="a", index=False, header=not out_path.exists())
+    return True
+
+
 def _evaluate_fold(
     *,
     exp_cfg: dict,
@@ -433,6 +481,7 @@ def _evaluate_fold(
     skip_live_inference: bool,
     add_uncertainty: bool,
     allow_missing_gating_cache: bool,
+    skip_learned_combiners: bool,
     eval_split: str,
     fit_rows_override: Optional[list[dict]] = None,
 ) -> tuple[str, list[dict], list[dict]]:
@@ -595,15 +644,16 @@ def _evaluate_fold(
               f"HD95={agg.get('hd95_mean', float('nan')):.2f}  "
               f"NSD={agg.get('nsd_mean', 0):.4f}")
 
+        if skip_learned_combiners:
+            print("  [skip learned combiners via --skip-learned-combiners]")
+            continue
+
         if not has_fit_probs:
             print(f"  [skip learned combiners - no fit probs for {layer_tag}]")
             continue
 
-        print(f"  Collecting {layer_tag} fit data...")
-        X_fit, y_fit = _collect_oof_flat(fit_rows, fit_oof_map, dataset_cfg)
-        if X_fit.size == 0:
-            print("  [skip - no fit data]")
-            continue
+        fit_source = _FlatOOFChunkSource(fit_rows, fit_oof_map, dataset_cfg)
+        print(f"  Streaming {layer_tag} fit data...")
 
         combiner_specs = [
             (f"{layer_tag}_ole", OLECombiner(mode="lsq_bounded")),
@@ -613,7 +663,11 @@ def _evaluate_fold(
 
         for method, comb in combiner_specs:
             print(f"  Fitting {method}...")
-            comb.fit(X_fit, y_fit, num_classes=num_classes)
+            try:
+                comb.fit(fit_source, None, num_classes=num_classes)
+            except ValueError as exc:
+                print(f"  [skip - {exc}]")
+                continue
             ps = _eval_combiner_per_sample(
                 comb.predict, eval_rows, eval_oof_map, dataset_cfg, num_classes,
             )
@@ -676,6 +730,8 @@ def main() -> None:
                     help="Evaluate Layer2 models without uncertainty channels")
     ap.add_argument("--allow-missing-gating-cache", action="store_true",
                     help="Do not fail when a trained gating checkpoint exists but metrics cache is missing")
+    ap.add_argument("--skip-learned-combiners", action="store_true",
+                    help="Skip learned combiners (OLE / DT / WE-CLPSO) and only evaluate main methods")
     args = ap.parse_args()
 
     exp_cfg = load_config(args.exp)
@@ -718,6 +774,15 @@ def main() -> None:
     else:
         device = torch.device("cpu")
 
+    per_sample_path: Optional[Path] = None
+    by_fold_path: Optional[Path] = None
+    if run_all_folds:
+        per_sample_path = results_dir / f"metrics_per_sample_{dataset_name}_{output_tag}.csv"
+        by_fold_path = results_dir / f"metrics_by_fold_{dataset_name}_{output_tag}.csv"
+        for path in (per_sample_path, by_fold_path):
+            if path.exists():
+                path.unlink()
+
     all_per_sample: List[Dict[str, Any]] = []
     fold_summary_records: List[Dict[str, Any]] = []
     summary_records: List[Dict[str, Any]] = []
@@ -742,25 +807,36 @@ def main() -> None:
             skip_live_inference=bool(args.skip_live_inference),
             add_uncertainty=not args.no_uncertainty,
             allow_missing_gating_cache=bool(args.allow_missing_gating_cache),
+            skip_learned_combiners=bool(args.skip_learned_combiners),
             eval_split=selection.eval_split or f"val_fold{fold}",
             fit_rows_override=fit_rows_override,
         )
         final_split = fold_split
         fold_summary_records.extend(fold_summary)
-        all_per_sample.extend(fold_per_sample)
+        if run_all_folds:
+            if per_sample_path is not None and _append_records_csv(fold_per_sample, per_sample_path):
+                print(f"Flushed per-sample rows for fold{fold}: {per_sample_path}")
+            if by_fold_path is not None and _append_records_csv(fold_summary, by_fold_path):
+                print(f"Flushed by-fold summary for fold{fold}: {by_fold_path}")
+        else:
+            all_per_sample.extend(fold_per_sample)
 
+    ps_df = pd.DataFrame()
     if run_all_folds:
-        summary_records = _aggregate_overall(all_per_sample, dataset_name, display_split)
+        if per_sample_path is not None and per_sample_path.exists():
+            ps_df = pd.read_csv(per_sample_path)
+        summary_records = _aggregate_overall_df(ps_df, dataset_name, display_split)
     else:
         output_tag = f"fold{target_folds[0]}_{final_split}"
         display_split = str(final_split)
         summary_records = fold_summary_records
+        ps_df = pd.DataFrame(all_per_sample) if all_per_sample else pd.DataFrame()
+        per_sample_path = results_dir / f"metrics_per_sample_{dataset_name}_{output_tag}.csv"
 
     print("=" * 60)
     print("Phase E: Statistical significance (Wilcoxon)")
     print("=" * 60)
 
-    ps_df = pd.DataFrame(all_per_sample) if all_per_sample else pd.DataFrame()
     if not ps_df.empty:
         sig_df = _wilcoxon_pairwise(ps_df, metric="dice_mean")
         if not sig_df.empty:
@@ -774,10 +850,10 @@ def main() -> None:
         else:
             print("  No method pairs with enough samples for testing")
 
-    if not ps_df.empty:
-        ps_path = results_dir / f"metrics_per_sample_{dataset_name}_{output_tag}.csv"
-        ps_df.to_csv(ps_path, index=False)
-        print(f"\nWrote per-sample: {ps_path}")
+    if not ps_df.empty and per_sample_path is not None:
+        if not run_all_folds:
+            ps_df.to_csv(per_sample_path, index=False)
+        print(f"\nWrote per-sample: {per_sample_path}")
 
     if summary_records:
         sum_df = pd.DataFrame(summary_records)
@@ -785,19 +861,21 @@ def main() -> None:
         sum_df.to_csv(sum_path, index=False)
         print(f"Wrote summary:    {sum_path}")
 
-        if run_all_folds and fold_summary_records:
+        if run_all_folds and by_fold_path is not None and by_fold_path.exists():
+            print(f"Wrote by-fold:    {by_fold_path}")
+        elif run_all_folds and fold_summary_records:
             fold_df = pd.DataFrame(fold_summary_records)
-            fold_path = results_dir / f"metrics_by_fold_{dataset_name}_{output_tag}.csv"
-            fold_df.to_csv(fold_path, index=False)
-            print(f"Wrote by-fold:    {fold_path}")
+            by_fold_path = results_dir / f"metrics_by_fold_{dataset_name}_{output_tag}.csv"
+            fold_df.to_csv(by_fold_path, index=False)
+            print(f"Wrote by-fold:    {by_fold_path}")
 
         tables_dir = ensure_dir(Path(
             exp_cfg.get("output", {}).get("tables_dir",
                 f"runs/{exp_cfg['exp_name']}/tables").replace("${exp_name}", exp_cfg["exp_name"])
         ))
         sum_df.to_csv(tables_dir / "metrics.csv", index=False)
-        if not ps_df.empty:
-            ps_df.to_csv(tables_dir / "metrics_per_sample.csv", index=False)
+        if not ps_df.empty and per_sample_path is not None and per_sample_path.exists():
+            shutil.copyfile(per_sample_path, tables_dir / "metrics_per_sample.csv")
 
         print("\n" + "=" * 70)
         print("SUMMARY")

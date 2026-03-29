@@ -1,9 +1,46 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional, Tuple, Union
 
 import numpy as np
+
+
+ArrayLikePreds = Union[np.ndarray, Iterable[Tuple[np.ndarray, np.ndarray]]]
+
+
+def _flatten_preds_gt(preds: np.ndarray, gt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if preds.ndim < 3:
+        raise ValueError(f"probs must have at least 3 dims [...,K,M], got {preds.shape}")
+    k_experts = preds.shape[-2]
+    num_classes = preds.shape[-1]
+    preds2 = preds.reshape(-1, k_experts, num_classes)
+    gt2 = gt.reshape(-1)
+    if preds2.shape[0] != gt2.shape[0]:
+        raise ValueError(f"probs and gt pixel counts mismatch: {preds2.shape[0]} vs {gt2.shape[0]}")
+    return preds2, gt2
+
+
+def _iter_flat_chunks(
+    probs: ArrayLikePreds,
+    target: Optional[np.ndarray] = None,
+) -> Iterable[tuple[np.ndarray, np.ndarray]]:
+    if isinstance(probs, np.ndarray):
+        if target is None:
+            raise ValueError("target is required when probs is a numpy array")
+        yield _flatten_preds_gt(probs, target)
+        return
+
+    if target is not None:
+        raise ValueError("target must be None when probs is an iterable of (preds, gt) pairs")
+
+    yielded = False
+    for p_chunk, g_chunk in probs:
+        yielded = True
+        yield _flatten_preds_gt(np.asarray(p_chunk), np.asarray(g_chunk))
+
+    if not yielded:
+        raise ValueError("probs iterable produced no data")
 
 
 @dataclass
@@ -30,30 +67,52 @@ class DecisionTemplateCombiner:
     def __init__(self):
         self.state: Optional[DecisionTemplateState] = None
 
-    def fit(self, probs: np.ndarray, target: np.ndarray, num_classes: int) -> DecisionTemplateState:
+    def fit(
+        self,
+        probs: ArrayLikePreds,
+        target: Optional[np.ndarray],
+        num_classes: int,
+    ) -> DecisionTemplateState:
         """Fit templates.
 
         probs: [N,K,M]
         target: [N]
         """
-        N, K, M = probs.shape
-        assert M == num_classes
+        templates: Optional[np.ndarray] = None
+        counts = np.zeros((num_classes,), dtype=np.int64)
+        global_sum: Optional[np.ndarray] = None
+        global_count = 0
 
-        templates = np.zeros((M, K, M), dtype=np.float64)
-        counts = np.zeros((M,), dtype=np.int64)
-
-        for c in range(M):
-            idx = np.where(target == c)[0]
-            counts[c] = idx.size
-            if idx.size == 0:
+        for probs_flat, target_flat in _iter_flat_chunks(probs, target):
+            if probs_flat.size == 0:
                 continue
-            templates[c] = probs[idx].mean(axis=0)
 
-        # handle empty class by global mean
-        global_mean = probs.mean(axis=0)
-        for c in range(M):
+            _, k_experts, m_classes = probs_flat.shape
+            if m_classes != num_classes:
+                raise ValueError(f"Expected {num_classes} classes, got {m_classes}")
+
+            if templates is None or global_sum is None:
+                templates = np.zeros((num_classes, k_experts, num_classes), dtype=np.float64)
+                global_sum = np.zeros((k_experts, num_classes), dtype=np.float64)
+
+            global_sum += probs_flat.sum(axis=0, dtype=np.float64)
+            global_count += int(probs_flat.shape[0])
+
+            for c in range(num_classes):
+                yc = target_flat == c
+                counts[c] += int(np.sum(yc))
+                if np.any(yc):
+                    templates[c] += probs_flat[yc].sum(axis=0, dtype=np.float64)
+
+        if templates is None or global_sum is None or global_count == 0:
+            raise ValueError("No OOF pixels found for fitting Decision Template")
+
+        global_mean = global_sum / float(global_count)
+        for c in range(num_classes):
             if counts[c] == 0:
                 templates[c] = global_mean
+            else:
+                templates[c] /= float(counts[c])
 
         self.state = DecisionTemplateState(templates=templates.astype(np.float32))
         return self.state

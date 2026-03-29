@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Tuple, Union
+from typing import Iterable, Optional, Tuple, Union
 
 import numpy as np
 
@@ -19,6 +19,28 @@ def _flatten_preds_gt(preds: np.ndarray, gt: np.ndarray) -> tuple[np.ndarray, np
     if preds2.shape[0] != gt2.shape[0]:
         raise ValueError(f"oof_preds and gt pixel counts mismatch: {preds2.shape[0]} vs {gt2.shape[0]}")
     return preds2, gt2
+
+
+def _iter_flat_chunks(
+    oof_preds: ArrayLikePreds,
+    gt: Optional[np.ndarray] = None,
+) -> Iterable[tuple[np.ndarray, np.ndarray]]:
+    if isinstance(oof_preds, np.ndarray):
+        if gt is None:
+            raise ValueError("gt is required when oof_preds is a numpy array")
+        yield _flatten_preds_gt(oof_preds, gt)
+        return
+
+    if gt is not None:
+        raise ValueError("gt must be None when oof_preds is an iterable of (preds, gt) pairs")
+
+    yielded = False
+    for p_chunk, g_chunk in oof_preds:
+        yielded = True
+        yield _flatten_preds_gt(np.asarray(p_chunk), np.asarray(g_chunk))
+
+    if not yielded:
+        raise ValueError("oof_preds iterable produced no data")
 
 
 def _maybe_sample_global(
@@ -80,6 +102,74 @@ def _maybe_sample_per_class(
     return preds[idx], gt[idx]
 
 
+def _accumulate_normal_equations(
+    chunks: Iterable[tuple[np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray]:
+    gram: Optional[np.ndarray] = None
+    rhs: Optional[np.ndarray] = None
+
+    for preds_flat, gt_flat in chunks:
+        if preds_flat.size == 0:
+            continue
+
+        _, k_experts, num_classes = preds_flat.shape
+        if gram is None or rhs is None:
+            gram = np.zeros((num_classes, k_experts, k_experts), dtype=np.float64)
+            rhs = np.zeros((num_classes, k_experts), dtype=np.float64)
+
+        for m in range(num_classes):
+            xm = preds_flat[:, :, m].astype(np.float64, copy=False)
+            ym = (gt_flat == m).astype(np.float64, copy=False)
+            gram[m] += xm.T @ xm
+            rhs[m] += xm.T @ ym
+
+    if gram is None or rhs is None:
+        raise ValueError("No OOF pixels found for fitting")
+    return gram, rhs
+
+
+def _compressed_lsq_inputs(gram: np.ndarray, rhs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    gram_sym = 0.5 * (gram + gram.T)
+    eigvals, eigvecs = np.linalg.eigh(gram_sym)
+    eigvals = np.clip(eigvals, 0.0, None)
+    a_mat = np.diag(np.sqrt(eigvals)) @ eigvecs.T
+    c_vec = np.linalg.pinv(a_mat.T, rcond=1e-12) @ rhs
+    return a_mat, c_vec
+
+
+def _solve_from_normal_equations(
+    gram: np.ndarray,
+    rhs: np.ndarray,
+    *,
+    bounds: tuple[float, float],
+    method: str,
+) -> np.ndarray:
+    method = str(method).lower()
+    l_bound, u_bound = float(bounds[0]), float(bounds[1])
+    num_classes, k_experts, _ = gram.shape
+    weights = np.zeros((k_experts, num_classes), dtype=np.float64)
+
+    if method == "nnls":
+        from scipy.optimize import nnls
+    elif method == "bvls":
+        from scipy.optimize import lsq_linear
+
+    for m in range(num_classes):
+        a_mat, c_vec = _compressed_lsq_inputs(gram[m], rhs[m])
+        if method == "ls":
+            sol, *_ = np.linalg.lstsq(a_mat, c_vec, rcond=None)
+        elif method == "nnls":
+            sol, _ = nnls(a_mat, c_vec)
+        elif method == "bvls":
+            res = lsq_linear(a_mat, c_vec, bounds=(l_bound, u_bound))
+            sol = res.x
+        else:
+            raise ValueError(f"Unknown method: {method} (use 'ls', 'nnls', or 'bvls')")
+        weights[:, m] = sol
+
+    return weights.astype(np.float32)
+
+
 def fit_from_oof(
     oof_preds: ArrayLikePreds,
     gt: Optional[np.ndarray] = None,
@@ -101,71 +191,38 @@ def fit_from_oof(
 
     rng = np.random.default_rng(int(seed))
 
-    if isinstance(oof_preds, np.ndarray):
-        if gt is None:
-            raise ValueError("gt is required when oof_preds is a numpy array")
-        preds_flat, gt_flat = _flatten_preds_gt(oof_preds, gt)
-    else:
-        if gt is not None:
-            raise ValueError("gt must be None when oof_preds is an iterable of (preds, gt) pairs")
-        preds_list = []
-        gt_list = []
-        for p_chunk, g_chunk in oof_preds:
-            p2, g2 = _flatten_preds_gt(np.asarray(p_chunk), np.asarray(g_chunk))
-            p2, g2 = _maybe_sample_global(p2, g2, rng=rng, pixel_sample_ratio=pixel_sample_ratio)
-            preds_list.append(p2)
-            gt_list.append(g2)
-        if not preds_list:
-            raise ValueError("oof_preds iterable produced no data")
-        preds_flat = np.concatenate(preds_list, axis=0)
-        gt_flat = np.concatenate(gt_list, axis=0)
+    if pixel_sample_ratio is None and max_pixels_per_class is None:
+        chunks = _iter_flat_chunks(oof_preds, gt)
+        gram, rhs = _accumulate_normal_equations(chunks)
+        return _solve_from_normal_equations(gram, rhs, bounds=bounds, method=method)
 
+    preds_list = []
+    gt_list = []
+    for p_chunk, g_chunk in _iter_flat_chunks(oof_preds, gt):
+        p2, g2 = _maybe_sample_global(p_chunk, g_chunk, rng=rng, pixel_sample_ratio=pixel_sample_ratio)
+        preds_list.append(p2)
+        gt_list.append(g2)
+    if not preds_list:
+        raise ValueError("oof_preds produced no data")
+
+    preds_flat = np.concatenate(preds_list, axis=0)
+    gt_flat = np.concatenate(gt_list, axis=0)
     preds_flat, gt_flat = _maybe_sample_global(preds_flat, gt_flat, rng=rng, pixel_sample_ratio=pixel_sample_ratio)
 
-    _, K, M = preds_flat.shape
-    if gt_flat.min() < 0 or gt_flat.max() >= M:
-        raise ValueError(f"gt contains labels outside [0,{M-1}]")
+    _, _, num_classes = preds_flat.shape
+    if gt_flat.min() < 0 or gt_flat.max() >= num_classes:
+        raise ValueError(f"gt contains labels outside [0,{num_classes-1}]")
 
     preds_flat, gt_flat = _maybe_sample_per_class(
         preds_flat,
         gt_flat,
         rng=rng,
-        num_classes=M,
+        num_classes=num_classes,
         max_pixels_per_class=max_pixels_per_class,
     )
 
-    method = str(method).lower()
-    l, u = float(bounds[0]), float(bounds[1])
-
-    X_all = preds_flat.astype(np.float64)  # [N,K,M]
-    w = np.zeros((K, M), dtype=np.float64)
-
-    if method == "ls":
-        for m in range(M):
-            Xm = X_all[:, :, m]
-            ym = (gt_flat == m).astype(np.float64)
-            sol, *_ = np.linalg.lstsq(Xm, ym, rcond=None)
-            w[:, m] = sol
-    elif method == "nnls":
-        from scipy.optimize import nnls
-
-        for m in range(M):
-            Xm = X_all[:, :, m]
-            ym = (gt_flat == m).astype(np.float64)
-            sol, _ = nnls(Xm, ym)
-            w[:, m] = sol
-    elif method == "bvls":
-        from scipy.optimize import lsq_linear
-
-        for m in range(M):
-            Xm = X_all[:, :, m]
-            ym = (gt_flat == m).astype(np.float64)
-            res = lsq_linear(Xm, ym, bounds=(l, u))
-            w[:, m] = res.x
-    else:
-        raise ValueError(f"Unknown method: {method} (use 'ls', 'nnls', or 'bvls')")
-
-    return w.astype(np.float32)
+    gram, rhs = _accumulate_normal_equations(((preds_flat, gt_flat),))
+    return _solve_from_normal_equations(gram, rhs, bounds=bounds, method=method)
 
 
 def fuse(preds: np.ndarray, W: np.ndarray) -> np.ndarray:
@@ -214,7 +271,12 @@ class OLECombiner:
         self.rng = np.random.default_rng(seed)
         self.weights: Optional[OLEWeights] = None
 
-    def fit(self, probs: np.ndarray, target: np.ndarray, num_classes: int) -> OLEWeights:
+    def fit(
+        self,
+        probs: ArrayLikePreds,
+        target: Optional[np.ndarray],
+        num_classes: int,
+    ) -> OLEWeights:
         """Fit weights.
 
         Parameters
@@ -222,17 +284,22 @@ class OLECombiner:
         probs: [N, K, M] flattened per-pixel or per-sample class probs
         target: [N] int labels (0..M-1)
         """
-        N, K, M = probs.shape
-        assert M == num_classes
-        y = np.eye(M, dtype=np.float64)[target.astype(int)]  # [N,M]
-        X = probs.astype(np.float64)  # [N,K,M]
-
-        w = np.zeros((K, M), dtype=np.float64)
-
         if self.mode == "lsq_bounded":
             # Strict paper-style per-class bounded least squares on OOF pixels.
-            w = fit_from_oof(X.astype(np.float32), target.astype(np.int64), bounds=(0.0, 1.0), method="bvls", seed=self.seed).astype(np.float64)
+            w = fit_from_oof(
+                probs,
+                target,
+                bounds=(0.0, 1.0),
+                method="bvls",
+                seed=self.seed,
+            ).astype(np.float64)
         elif self.mode == "sgd_conv1x1":
+            if not isinstance(probs, np.ndarray) or target is None:
+                raise ValueError("sgd_conv1x1 mode requires in-memory numpy arrays for probs and target")
+            N, K, M = probs.shape
+            assert M == num_classes
+            y = np.eye(M, dtype=np.float64)[target.astype(int)]  # [N,M]
+            X = probs.astype(np.float64)  # [N,K,M]
             # SGD on mean squared error with projection to [0,1]
             w = self.rng.uniform(0.0, 1.0, size=(K, M)).astype(np.float64)
             for _ in range(self.max_iter):
