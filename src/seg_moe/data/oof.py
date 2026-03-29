@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 from seg_moe.utils.io import load_jsonl
+
+
+_VAL_FOLD_RE = re.compile(r"^val_fold(\d+)$")
 
 
 @dataclass(frozen=True)
@@ -16,6 +20,64 @@ class OOFRecord:
     num_classes: int
 
     raw: Dict[str, Any]
+
+
+def parse_val_fold(split: str) -> int | None:
+    """Return the validation fold index encoded in split, else None."""
+
+    match = _VAL_FOLD_RE.fullmatch(str(split).strip())
+    return int(match.group(1)) if match else None
+
+
+def resolve_prediction_cache_paths(
+    exp_cfg: Mapping[str, Any],
+    layer: str,
+    *,
+    predictor_fold: int,
+    split: str,
+) -> tuple[Path, Path]:
+    """Resolve cache dir and manifest path for a prediction split.
+
+    Validation folds keep using the shared OOF cache configured in the experiment
+    because those artifacts are used for layer-wise training without leakage.
+
+    Non-validation splits such as ``test`` are written to a dedicated inference
+    cache rooted at:
+
+      runs/${exp_name}/cache/inference/{layer}/fold_{predictor_fold}/{split}
+    """
+
+    exp_name = str(exp_cfg.get("exp_name", ""))
+    layering = dict(exp_cfg.get("layering", {}) or {})
+
+    def _resolve(path_like: str | Path) -> Path:
+        return Path(str(path_like).replace("${exp_name}", exp_name))
+
+    cache_root = _resolve(layering.get("cache_root", "runs/${exp_name}/cache"))
+    split = str(split).strip()
+    if not split:
+        raise ValueError("split must be a non-empty string")
+
+    if layer == "layer1":
+        default_cache_dir = cache_root / "oof" / "layer1"
+        cache_key = "oof_cache_dir"
+        manifest_key = "oof_manifest_path"
+        default_manifest = default_cache_dir / "oof_manifest.jsonl"
+    elif layer == "layer2":
+        default_cache_dir = cache_root / "oof" / "layer2"
+        cache_key = "l2_oof_cache_dir"
+        manifest_key = "l2_oof_manifest_path"
+        default_manifest = default_cache_dir / "oof_manifest_layer2.jsonl"
+    else:
+        raise ValueError(f"Unsupported layer={layer!r}; expected 'layer1' or 'layer2'")
+
+    if parse_val_fold(split) is not None:
+        cache_dir = _resolve(layering.get(cache_key, default_cache_dir))
+        manifest_path = _resolve(layering.get(manifest_key, default_manifest))
+        return cache_dir, manifest_path
+
+    infer_dir = cache_root / "inference" / layer / f"fold_{int(predictor_fold)}" / split
+    return infer_dir, infer_dir / "manifest.jsonl"
 
 
 def load_oof_manifest(manifest_path: str | Path, *, repo_root: Optional[str | Path] = None) -> Dict[str, OOFRecord]:

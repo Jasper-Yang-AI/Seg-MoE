@@ -16,7 +16,11 @@ from seg_moe.data.gating_patch_dataset import (
     extract_slice_index,
 )
 from seg_moe.data.indexing import infer_num_classes
-from seg_moe.data.oof import get_oof_prob_path, load_oof_manifest
+from seg_moe.data.oof import (
+    get_oof_prob_path,
+    load_oof_manifest,
+    resolve_prediction_cache_paths,
+)
 from seg_moe.data.transforms import imagenet_normalize
 from seg_moe.evaluation.metrics_2d import compute_segmentation_metrics_batch
 from seg_moe.gating.patch_gating_2d import PatchConvGate2D, PatchGatingConfig
@@ -317,38 +321,29 @@ def main() -> None:
     temperature = float(args.temperature) if args.temperature is not None else ckpt_temperature
     print(f"Gating inference | fold={fold} split={split} tau={temperature:.2f} domain=logits")
 
-    cache_root = Path(exp_cfg["layering"]["cache_root"].replace("${exp_name}", exp_cfg["exp_name"]))
-    l2_oof_manifest_path = Path(
-        str(
-            exp_cfg.get("layering", {}).get(
-                "l2_oof_manifest_path",
-                cache_root / "oof" / "layer2" / "oof_manifest_layer2.jsonl",
-            )
-        ).replace("${exp_name}", exp_cfg["exp_name"])
+    _, l2_manifest_path = resolve_prediction_cache_paths(
+        exp_cfg, "layer2", predictor_fold=fold, split=split
     )
-    if not l2_oof_manifest_path.exists():
+    if not l2_manifest_path.exists():
         raise FileNotFoundError(
-            f"Layer2 OOF manifest not found: {l2_oof_manifest_path}. "
-            "Run scripts/inference/generate_layer2_oof.py first."
+            f"Layer2 manifest not found for split={split}, fold={fold}: {l2_manifest_path}. "
+            f"Run scripts/inference/generate_layer2_oof.py --exp {args.exp} --models {args.models} "
+            f"--fold {fold} --split {split}"
         )
-    l2_oof_map = load_oof_manifest(l2_oof_manifest_path)
+    l2_oof_map = load_oof_manifest(l2_manifest_path)
 
     l1_oof_map = None
     if model.cfg.use_layer1_semantics:
-        l1_oof_manifest_path = Path(
-            str(
-                exp_cfg.get("layering", {}).get(
-                    "oof_manifest_path",
-                    cache_root / "oof" / "layer1" / "oof_manifest.jsonl",
-                )
-            ).replace("${exp_name}", exp_cfg["exp_name"])
+        _, l1_manifest_path = resolve_prediction_cache_paths(
+            exp_cfg, "layer1", predictor_fold=fold, split=split
         )
-        if not l1_oof_manifest_path.exists():
+        if not l1_manifest_path.exists():
             raise FileNotFoundError(
-                f"Layer1 OOF manifest not found: {l1_oof_manifest_path}. "
-                "Gate config requires Layer1 semantic priors."
+                f"Layer1 manifest not found for split={split}, fold={fold}: {l1_manifest_path}. "
+                f"Run scripts/inference/generate_layer1_oof.py --exp {args.exp} --models {args.models} "
+                f"--fold {fold} --split {split}"
             )
-        l1_oof_map = load_oof_manifest(l1_oof_manifest_path)
+        l1_oof_map = load_oof_manifest(l1_manifest_path)
 
     rows = _load_splits(dataset_cfg)
     eval_rows = [r for r in rows if r.get("split") == split]

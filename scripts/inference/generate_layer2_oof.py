@@ -1,28 +1,10 @@
 """
-Generate Layer2 Out-of-Fold (OOF) logit predictions.
+Generate Layer2 cached logits for validation or test splits.
 
-正确流程:  Layer1 train → L1 OOF → Layer2 train → **L2 OOF** → Gating train → Eval
-
-For each fold k, loads the Layer2 checkpoints trained on train_fold{k}
-and predicts on val_fold{k}.  Layer2 experts take concatenated input:
-  x = [image, L1_oof_probs, entropy, disagreement]  (in_channels=16)
-
-The L1 OOF probs are already generated (no leakage) and serve as
-the additional channels for Layer2 input.
-
-Output: cache/oof/layer2/fold_{k}/{sample_id}.npz  — logits shape [K, M, H, W]
-Manifest: cache/oof/layer2/oof_manifest_layer2.jsonl
-
-Usage:
-    python scripts/inference/generate_layer2_oof.py \\
-        --exp configs/2d/exp/exp_msd_task03_liver.yaml \\
-        --models configs/2d/models.yaml --which best
-
-    # With TTA & batch inference:
-    python scripts/inference/generate_layer2_oof.py \\
-        --exp configs/2d/exp/exp_msd_task03_liver.yaml \\
-        --models configs/2d/models.yaml --which best \\
-        --batch-size 32 --tta
+Validation folds keep writing to the shared Layer2 OOF manifest used by gating
+training. Explicit non-validation splits such as ``test`` are written to a
+dedicated inference manifest so gating/evaluation can reuse the same cache path
+logic without polluting training OOF artifacts.
 """
 from __future__ import annotations
 
@@ -38,6 +20,7 @@ from tqdm import tqdm
 
 from seg_moe.data.indexing import infer_image_channels, infer_num_classes
 from seg_moe.data.layer2_oof_dataset import Layer2OOFDataset
+from seg_moe.data.oof import parse_val_fold, resolve_prediction_cache_paths
 from seg_moe.models.factory_2d import build_expert, expert_name, list_experts
 from seg_moe.utils.checkpoint import load_trusted_model_state_dict
 from seg_moe.utils.config import load_config, resolve_run_dir
@@ -57,7 +40,6 @@ def _load_splits(dataset_cfg: dict) -> list[dict]:
 
 
 def _l2_ckpt_path(run_dir: Path, fold: int, ex: str, which: str) -> Path:
-    """Layer2 checkpoint: checkpoints/layer2/fold{k}/{expert}/best.pt"""
     return run_dir / "checkpoints" / "layer2" / f"fold{fold}" / ex / f"{which}.pt"
 
 
@@ -73,12 +55,42 @@ def _find_folds(rows: list[dict]) -> list[int]:
     return sorted(folds)
 
 
+def _record_key(record: dict) -> tuple[str, int, str]:
+    return (
+        str(record.get("split", "")),
+        int(record.get("predictor_fold", -1)),
+        str(record.get("sample_id", "")),
+    )
+
+
+def _resolve_targets(rows: list[dict], fold: int | None, split: str | None) -> list[tuple[int, str]]:
+    if split is not None:
+        split = str(split).strip()
+        split_fold = parse_val_fold(split)
+        if split == "test":
+            if fold is None:
+                raise ValueError("--fold is required when --split test to choose predictor checkpoints")
+            return [(int(fold), split)]
+        if split_fold is None:
+            raise ValueError(f"Unsupported split={split!r}; expected val_fold{{k}} or test")
+        if fold is not None and int(fold) != split_fold:
+            raise ValueError(f"--fold {fold} conflicts with --split {split}")
+        return [(split_fold, split)]
+
+    if fold is not None:
+        return [(int(fold), f"val_fold{int(fold)}")]
+
+    return [(f, f"val_fold{f}") for f in _find_folds(rows)]
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Generate Layer2 OOF logit predictions")
+    ap = argparse.ArgumentParser(description="Generate Layer2 cached logit predictions")
     ap.add_argument("--exp", required=True, help="Experiment config")
     ap.add_argument("--models", required=True, help="Expert model config")
     ap.add_argument("--which", choices=["best", "last"], default="best")
-    ap.add_argument("--fold", type=int, default=None, help="Single fold (default: all)")
+    ap.add_argument("--fold", type=int, default=None, help="Predictor fold (default: all val folds)")
+    ap.add_argument("--split", type=str, default=None,
+                    help="Target split to cache (for example val_fold0 or test)")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=32,
                     help="Inference batch size (default: 32, 2D slices)")
@@ -94,72 +106,63 @@ def main() -> None:
     models_cfg = load_config(args.models)
     run_dir = Path(resolve_run_dir(exp_cfg))
 
-    cache_root = Path(
-        str(exp_cfg["layering"].get("cache_root", f"runs/${{exp_name}}/cache"))
-        .replace("${exp_name}", exp_cfg["exp_name"])
-    )
+    rows = _load_splits(dataset_cfg)
+    targets = _resolve_targets(rows, args.fold, args.split)
+    manifest_paths = {
+        resolve_prediction_cache_paths(exp_cfg, "layer2", predictor_fold=fold, split=split)[1]
+        for fold, split in targets
+    }
+    if len(manifest_paths) != 1:
+        raise ValueError(
+            "This command can write only one manifest per run. "
+            "Use separate invocations when mixing validation and non-validation splits."
+        )
+    manifest_path = next(iter(manifest_paths))
+    ensure_dir(manifest_path.parent)
+
     cache_dtype_str = str(exp_cfg.get("layering", {}).get("cache_dtype", "float16")).lower()
     cache_dtype = np.float16 if cache_dtype_str in {"float16", "fp16", "f16"} else np.float32
-
-    # ── Layer1 OOF manifest (needed as input to Layer2) ──
-    l1_oof_manifest_path = Path(
-        str(exp_cfg.get("layering", {}).get(
-            "oof_manifest_path",
-            cache_root / "oof" / "layer1" / "oof_manifest.jsonl",
-        )).replace("${exp_name}", exp_cfg["exp_name"])
-    )
-    if not l1_oof_manifest_path.exists():
-        raise FileNotFoundError(
-            f"Layer1 OOF manifest not found: {l1_oof_manifest_path}. "
-            "Run scripts/inference/generate_layer1_oof.py first."
-        )
-
-    # ── Layer2 OOF output paths ──
-    l2_oof_cache_dir = Path(
-        str(exp_cfg.get("layering", {}).get(
-            "l2_oof_cache_dir",
-            cache_root / "oof" / "layer2",
-        )).replace("${exp_name}", exp_cfg["exp_name"])
-    )
-    l2_oof_manifest_path = Path(
-        str(exp_cfg.get("layering", {}).get(
-            "l2_oof_manifest_path",
-            l2_oof_cache_dir / "oof_manifest_layer2.jsonl",
-        )).replace("${exp_name}", exp_cfg["exp_name"])
-    )
-    ensure_dir(l2_oof_cache_dir)
-
-    rows = _load_splits(dataset_cfg)
-    folds = [int(args.fold)] if args.fold is not None else _find_folds(rows)
 
     num_classes = infer_num_classes(dataset_cfg)
     base_in = infer_image_channels(dataset_cfg)
     expert_cfgs = list_experts(models_cfg)
-    K = len(expert_cfgs)
+    num_experts = len(expert_cfgs)
 
-    # ── Layer2 input channels (must match training) ──
     add_uncertainty = not args.no_uncertainty
     extra_uncertainty_ch = (1 + num_classes) if add_uncertainty else 0
-    in_channels = base_in + K * num_classes + extra_uncertainty_ch
+    in_channels = base_in + num_experts * num_classes + extra_uncertainty_ch
     unc_str = f" + uncertainty({extra_uncertainty_ch}ch)" if add_uncertainty else ""
-    print(f"Layer2 OOF | in_channels={in_channels} (base={base_in} + {K}x{num_classes}{unc_str})")
+    print(f"Layer2 cache | in_channels={in_channels} (base={base_in} + {num_experts}x{num_classes}{unc_str})")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    existing_map: Dict[str, dict] = {}
-    if args.skip_existing and l2_oof_manifest_path.exists():
-        for r in load_jsonl(l2_oof_manifest_path):
-            existing_map[(int(r.get("sample_fold", -1)), str(r.get("sample_id")))] = r
+    existing_map: Dict[tuple[str, int, str], dict] = {}
+    if args.skip_existing and manifest_path.exists():
+        for row in load_jsonl(manifest_path):
+            existing_map[_record_key(row)] = row
 
     all_records: List[Dict[str, Any]] = []
     ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    for fold in folds:
-        val_split = f"val_fold{fold}"
-        val_rows = [r for r in rows if r.get("split") == val_split]
-        fold_dir = ensure_dir(l2_oof_cache_dir / f"fold_{fold}")
+    for fold, split in targets:
+        split_rows = [r for r in rows if r.get("split") == split]
+        if not split_rows:
+            raise ValueError(f"No samples found for split={split}")
 
-        # ── Pre-load all Layer2 expert models for this fold ──
+        _, l1_manifest_path = resolve_prediction_cache_paths(
+            exp_cfg, "layer1", predictor_fold=fold, split=split
+        )
+        if not l1_manifest_path.exists():
+            raise FileNotFoundError(
+                f"Layer1 manifest not found for split={split}, fold={fold}: {l1_manifest_path}. "
+                f"Run scripts/inference/generate_layer1_oof.py --exp {args.exp} --models {args.models} "
+                f"--fold {fold} --split {split}"
+            )
+
+        cache_dir, _ = resolve_prediction_cache_paths(exp_cfg, "layer2", predictor_fold=fold, split=split)
+        fold_dir = ensure_dir(cache_dir / f"fold_{fold}") if parse_val_fold(split) is not None else ensure_dir(cache_dir)
+        sample_fold = int(fold) if parse_val_fold(split) is not None else -1
+
         ckpt_map: Dict[str, str] = {}
         expert_models: List[torch.nn.Module] = []
         for ec in expert_cfgs:
@@ -167,8 +170,7 @@ def main() -> None:
             ckpt = _l2_ckpt_path(run_dir, fold, ex, args.which)
             if not ckpt.exists():
                 raise FileNotFoundError(
-                    f"Missing Layer2 checkpoint: {ckpt}. "
-                    "Run scripts/train/train_layer2.py first."
+                    f"Missing Layer2 checkpoint: {ckpt}. Run scripts/train/train_layer2.py first."
                 )
             ckpt_map[ex] = str(ckpt)
             model = build_expert(ec, in_channels=in_channels, num_classes=num_classes)
@@ -177,10 +179,11 @@ def main() -> None:
             print(f"  [fold{fold}] Loaded L2-{ex} from {ckpt}")
             expert_models.append(model)
 
-        # ── Layer2OOFDataset: provides [image + L1_probs + uncertainty] ──
         ds = Layer2OOFDataset(
-            val_rows, dataset_cfg, l1_oof_manifest_path,
-            expected_num_experts=K,
+            split_rows,
+            dataset_cfg,
+            l1_manifest_path,
+            expected_num_experts=num_experts,
             augs_cfg=None,
             is_train=False,
             limit=args.limit,
@@ -188,43 +191,39 @@ def main() -> None:
         )
         dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
 
-        for x_batch, _, meta_batch in tqdm(dl, desc=f"L2-OOF fold{fold}"):
-            # x_batch: [B, in_channels, H, W]  (image + L1_probs + uncertainty)
-            B = x_batch.shape[0]
+        for x_batch, _, meta_batch in tqdm(dl, desc=f"L2 cache fold{fold} {split}"):
+            batch_size = x_batch.shape[0]
             ids = meta_batch["id"] if isinstance(meta_batch["id"], list) else [meta_batch["id"]]
-            if len(ids) != B:
-                ids = [ids[0]] * B
+            if len(ids) != batch_size:
+                ids = [ids[0]] * batch_size
 
-            # ── Collect per-expert Layer2 predictions ──
-            batch_expert_logits = []  # List[np.ndarray], each [B, M, H, W]
+            batch_expert_logits = []
+            x_batch = x_batch.to(device)
             for model in expert_models:
                 with torch.no_grad():
-                    raw_logits = model(x_batch.to(device))  # [B, M, H, W]
+                    raw_logits = model(x_batch)
 
                     if args.tta:
-                        # Horizontal flip
-                        x_h = torch.flip(x_batch.to(device), dims=[-1])
+                        x_h = torch.flip(x_batch, dims=[-1])
                         logits_h = model(x_h)
                         logits_h = torch.flip(logits_h, dims=[-1])
-                        # Vertical flip
-                        x_v = torch.flip(x_batch.to(device), dims=[-2])
+                        x_v = torch.flip(x_batch, dims=[-2])
                         logits_v = model(x_v)
                         logits_v = torch.flip(logits_v, dims=[-2])
                         raw_logits = (raw_logits + logits_h + logits_v) / 3.0
 
-                    batch_expert_logits.append(raw_logits.cpu().numpy())  # [B, M, H, W]
+                    batch_expert_logits.append(raw_logits.cpu().numpy())
 
-            # ── Save per-sample ──
-            for b_idx in range(B):
-                sample_id = ids[b_idx]
+            for batch_idx in range(batch_size):
+                sample_id = ids[batch_idx]
                 out_path = fold_dir / f"{sample_id}.npz"
-                rel_path = Path(f"fold_{fold}") / f"{sample_id}.npz"
+                rel_path = out_path.relative_to(manifest_path.parent)
 
-                rec: Dict[str, Any] = {
+                record: Dict[str, Any] = {
                     "sample_id": str(sample_id),
-                    "sample_fold": int(fold),
+                    "sample_fold": int(sample_fold),
                     "predictor_fold": int(fold),
-                    "split": val_split,
+                    "split": split,
                     "prob_path": rel_path.as_posix(),
                     "has_logits": True,
                     "num_classes": int(num_classes),
@@ -238,25 +237,23 @@ def main() -> None:
                     "dataset": str(dataset_cfg.get("name")),
                     "tta": args.tta,
                     "layer": "layer2",
-                    "l1_oof_manifest": str(l1_oof_manifest_path),
+                    "l1_oof_manifest": str(l1_manifest_path),
                 }
 
                 if args.skip_existing and out_path.exists():
-                    k = (int(fold), str(sample_id))
-                    all_records.append(existing_map.get(k, rec))
+                    all_records.append(existing_map.get(_record_key(record), record))
                     continue
 
-                logits_k = [el[b_idx].astype(cache_dtype) for el in batch_expert_logits]
+                logits_k = [arr[batch_idx].astype(cache_dtype) for arr in batch_expert_logits]
                 np.savez_compressed(out_path, logits=np.stack(logits_k, axis=0))
-                all_records.append(rec)
+                all_records.append(record)
 
-    # ── Save manifest ──
     merged = dict(existing_map)
-    for r in all_records:
-        merged[(int(r.get("sample_fold", -1)), str(r.get("sample_id")))] = r
-    ensure_dir(l2_oof_manifest_path.parent)
-    save_jsonl(l2_oof_manifest_path, list(merged.values()))
-    print(f"Saved Layer2 OOF manifest: {l2_oof_manifest_path} (rows={len(merged)})")
+    for record in all_records:
+        merged[_record_key(record)] = record
+
+    save_jsonl(manifest_path, list(merged.values()))
+    print(f"Saved Layer2 manifest: {manifest_path} (rows={len(merged)})")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
 """
 Comprehensive evaluation: single experts + ensembles + combiners + gating.
-
-科研专家级评估流程 (References):
+评估流程 (References):
   - Maier-Hein et al. 2024, "Metrics Reloaded", Nature Methods
     → DSC + HD95 + NSD 为三大核心指标; per-class 报告
   - Dang et al. 2024, "Two-layer Ensemble of Deep Learning Models"
@@ -60,8 +59,13 @@ from seg_moe.combiners.ole import OLECombiner
 from seg_moe.combiners.we_clpso import WECLPSOCombiner
 from seg_moe.data.dataset_2d import SegmentationDataset2D
 from seg_moe.data.indexing import infer_image_channels, infer_num_classes
-from seg_moe.data.oof import load_oof_manifest, get_oof_prob_path
+from seg_moe.data.oof import (
+    get_oof_prob_path,
+    load_oof_manifest,
+    resolve_prediction_cache_paths,
+)
 from seg_moe.evaluation.metrics_2d import compute_segmentation_metrics_batch
+from seg_moe.evaluation.split_selection import resolve_eval_selection
 from seg_moe.models.factory_2d import build_expert, expert_name, list_experts
 from seg_moe.utils.checkpoint import load_trusted_model_state_dict
 from seg_moe.utils.config import load_config, resolve_run_dir
@@ -429,7 +433,7 @@ def _evaluate_fold(
     skip_live_inference: bool,
     add_uncertainty: bool,
     allow_missing_gating_cache: bool,
-    prefer_test: bool,
+    eval_split: str,
     fit_rows_override: Optional[list[dict]] = None,
 ) -> tuple[str, list[dict], list[dict]]:
     dataset_name = str(dataset_cfg["name"])
@@ -439,12 +443,10 @@ def _evaluate_fold(
     all_expert_names = [expert_name(ec) for ec in expert_cfgs]
     K = len(expert_cfgs)
 
-    split_candidates = ["test", f"val_fold{fold}"] if prefer_test else [f"val_fold{fold}"]
-    split = next(
-        (s for s in split_candidates if any(r.get("split") == s for r in rows)),
-        f"val_fold{fold}",
-    )
+    split = str(eval_split)
     eval_rows = [r for r in rows if r.get("split") == split]
+    if not eval_rows:
+        raise ValueError(f"No samples found for split={split}")
     if fit_rows_override is not None:
         fit_rows = list(fit_rows_override)
     else:
@@ -498,7 +500,9 @@ def _evaluate_fold(
             torch.cuda.empty_cache()
 
     # Phase B: Layer2 single experts
-    l1_manifest = _resolve_manifest(exp_cfg, "oof_manifest_path", "oof/layer1/oof_manifest.jsonl")
+    _, l1_manifest = resolve_prediction_cache_paths(
+        exp_cfg, "layer1", predictor_fold=fold, split=split
+    )
     if l1_manifest.exists() and not skip_live_inference:
         try:
             from seg_moe.data.layer2_oof_dataset import Layer2OOFDataset
@@ -539,25 +543,31 @@ def _evaluate_fold(
             print(f"  Phase B skipped: {e}")
 
     # Phase C: Ensembles + Combiners on OOF probs
-    oof_configs = []
+    oof_configs = [("L1", "layer1"), ("L2", "layer2")]
 
-    l1_manifest = _resolve_manifest(exp_cfg, "oof_manifest_path", "oof/layer1/oof_manifest.jsonl")
-    if l1_manifest.exists():
-        oof_configs.append(("L1", l1_manifest))
+    for layer_tag, layer_name in oof_configs:
+        _, eval_manifest_path = resolve_prediction_cache_paths(
+            exp_cfg, layer_name, predictor_fold=fold, split=split
+        )
+        if not eval_manifest_path.exists():
+            continue
+        eval_oof_map = load_oof_manifest(eval_manifest_path)
 
-    l2_manifest = _resolve_manifest(exp_cfg, "l2_oof_manifest_path", "oof/layer2/oof_manifest_layer2.jsonl")
-    if l2_manifest.exists():
-        oof_configs.append(("L2", l2_manifest))
-
-    for layer_tag, manifest_path in oof_configs:
-        oof_map = load_oof_manifest(manifest_path)
+        _, fit_manifest_path = resolve_prediction_cache_paths(
+            exp_cfg, layer_name, predictor_fold=fold, split=f"val_fold{fold}"
+        )
+        fit_oof_map = (
+            eval_oof_map
+            if fit_manifest_path == eval_manifest_path
+            else (load_oof_manifest(fit_manifest_path) if fit_manifest_path.exists() else {})
+        )
 
         has_probs = any(
-            str(s["id"]) in oof_map and get_oof_prob_path(oof_map, str(s["id"])).exists()
+            str(s["id"]) in eval_oof_map and get_oof_prob_path(eval_oof_map, str(s["id"])).exists()
             for s in eval_rows
         )
         has_fit_probs = any(
-            str(s["id"]) in oof_map and get_oof_prob_path(oof_map, str(s["id"])).exists()
+            str(s["id"]) in fit_oof_map and get_oof_prob_path(fit_oof_map, str(s["id"])).exists()
             for s in fit_rows
         )
         if not has_probs:
@@ -568,7 +578,7 @@ def _evaluate_fold(
         print("=" * 60)
 
         method = f"{layer_tag}_mean"
-        ps = _eval_mean_ensemble_from_oof(eval_rows, oof_map, dataset_cfg, num_classes)
+        ps = _eval_mean_ensemble_from_oof(eval_rows, eval_oof_map, dataset_cfg, num_classes)
         _record_method(method, ps)
         agg = summary_records[-1] if summary_records and summary_records[-1]["method"] == method else {}
         print(f"  {method}: Dice={agg.get('dice_mean', 0):.4f}  "
@@ -578,7 +588,7 @@ def _evaluate_fold(
         mv = MajorityVotingCombiner()
         mv.fit(np.zeros((1, K, num_classes)), np.zeros(1, dtype=np.int64), num_classes)
         method = f"{layer_tag}_majority"
-        ps = _eval_combiner_per_sample(mv.predict, eval_rows, oof_map, dataset_cfg, num_classes)
+        ps = _eval_combiner_per_sample(mv.predict, eval_rows, eval_oof_map, dataset_cfg, num_classes)
         _record_method(method, ps)
         agg = summary_records[-1] if summary_records and summary_records[-1]["method"] == method else {}
         print(f"  {method}: Dice={agg.get('dice_mean', 0):.4f}  "
@@ -590,7 +600,7 @@ def _evaluate_fold(
             continue
 
         print(f"  Collecting {layer_tag} fit data...")
-        X_fit, y_fit = _collect_oof_flat(fit_rows, oof_map, dataset_cfg)
+        X_fit, y_fit = _collect_oof_flat(fit_rows, fit_oof_map, dataset_cfg)
         if X_fit.size == 0:
             print("  [skip - no fit data]")
             continue
@@ -605,7 +615,7 @@ def _evaluate_fold(
             print(f"  Fitting {method}...")
             comb.fit(X_fit, y_fit, num_classes=num_classes)
             ps = _eval_combiner_per_sample(
-                comb.predict, eval_rows, oof_map, dataset_cfg, num_classes,
+                comb.predict, eval_rows, eval_oof_map, dataset_cfg, num_classes,
             )
             _record_method(method, ps)
             agg = summary_records[-1] if summary_records and summary_records[-1]["method"] == method else {}
@@ -629,7 +639,7 @@ def _evaluate_fold(
         if gating_ckpt.exists() and not allow_missing_gating_cache:
             raise FileNotFoundError(
                 "Gating checkpoint exists but cached inference results are missing. "
-                "Run scripts/inference/gating_inference.py before eval_methods.py, "
+                f"Run scripts/inference/gating_inference.py --fold {fold} --split {split} before eval_methods.py, "
                 "or pass --allow-missing-gating-cache to skip gating."
             )
         print("\n[Phase D skipped: no gating results cached]")
@@ -655,7 +665,9 @@ def main() -> None:
     ap.add_argument("--training", required=True)
     ap.add_argument("--models", required=True)
     ap.add_argument("--fold", default="0",
-                    help="Fold index (for example 0) or 'all' for overall CV evaluation")
+                    help="Fold index (for example 0), 'all', or 'test'")
+    ap.add_argument("--predictor-fold", type=int, default=0,
+                    help="Checkpoint fold used when --fold test (default: 0)")
     ap.add_argument("--which", choices=["best", "last"], default="best")
     ap.add_argument("--gpus", type=str, default=None)
     ap.add_argument("--skip-live-inference", action="store_true",
@@ -680,18 +692,20 @@ def main() -> None:
     if not available_val_folds:
         raise ValueError("No validation folds found in dataset splits.")
 
-    fold_arg = str(args.fold).strip().lower()
-    run_all_folds = fold_arg == "all"
+    selection = resolve_eval_selection(
+        args.fold,
+        available_val_folds,
+        has_test_split=any(r.get("split") == "test" for r in rows),
+        predictor_fold=int(args.predictor_fold),
+    )
+    run_all_folds = selection.run_all_folds
     if run_all_folds:
-        target_folds = available_val_folds
+        target_folds = selection.target_folds
         output_tag = "all_val_folds"
         display_split = "all_val_folds"
         print(f"Running overall CV evaluation across folds: {target_folds}")
     else:
-        fold = int(fold_arg)
-        if fold not in available_val_folds and not any(r.get("split") == "test" for r in rows):
-            raise ValueError(f"Requested fold {fold} not found. Available val folds: {available_val_folds}")
-        target_folds = [fold]
+        target_folds = selection.target_folds
         output_tag = ""
         display_split = ""
 
@@ -728,7 +742,7 @@ def main() -> None:
             skip_live_inference=bool(args.skip_live_inference),
             add_uncertainty=not args.no_uncertainty,
             allow_missing_gating_cache=bool(args.allow_missing_gating_cache),
-            prefer_test=not run_all_folds,
+            eval_split=selection.eval_split or f"val_fold{fold}",
             fit_rows_override=fit_rows_override,
         )
         final_split = fold_split
