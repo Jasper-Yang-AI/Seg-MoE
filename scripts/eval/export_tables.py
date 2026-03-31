@@ -46,6 +46,17 @@ def _order_metric_cols(cols: list[str]) -> list[str]:
     return ordered
 
 
+def _is_supported_method(method: str) -> bool:
+    method = str(method)
+    if method == "L1_ole":
+        return False
+    if method.startswith(("L1_", "L2_")):
+        return True
+    if method == "gating":
+        return True
+    return any(tag in method for tag in ("_mean", "_majority", "_ole"))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--exp", required=True)
@@ -82,6 +93,7 @@ def main() -> None:
         return
 
     all_df = pd.concat(frames, ignore_index=True)
+    all_df = all_df[all_df["method"].apply(_is_supported_method)].copy()
     tables_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine metric columns
@@ -110,7 +122,7 @@ def main() -> None:
         print(f"Wrote {out}")
 
     # ── Table 3: Ensemble / combiner results ──
-    ensemble_tags = ["_mean", "_majority", "_ole", "_dt", "_we_clpso", "gating"]
+    ensemble_tags = ["_mean", "_majority", "_ole", "gating"]
     ens = all_df[all_df["method"].apply(
         lambda m: any(tag in m for tag in ensemble_tags)
     )]
@@ -160,6 +172,11 @@ def main() -> None:
 
     if sig_frames:
         sig_df = pd.concat(sig_frames, ignore_index=True)
+        if {"method_a", "method_b"}.issubset(sig_df.columns):
+            sig_df = sig_df[
+                sig_df["method_a"].apply(_is_supported_method)
+                & sig_df["method_b"].apply(_is_supported_method)
+            ].copy()
         out = tables_dir / "table_significance.csv"
         sig_df.to_csv(out, index=False)
         print(f"Wrote {out}")

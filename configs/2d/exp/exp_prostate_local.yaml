@@ -16,8 +16,6 @@ methods:
   - mean_ensemble
   - majority_voting
   - ole
-  - dt
-  - we_clpso
   - gating
 
 layering:

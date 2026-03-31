@@ -54,10 +54,8 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from seg_moe.combiners.decision_template import DecisionTemplateCombiner
 from seg_moe.combiners.majority_voting import MajorityVotingCombiner
 from seg_moe.combiners.ole import OLECombiner
-from seg_moe.combiners.we_clpso import WECLPSOCombiner
 from seg_moe.data.dataset_2d import SegmentationDataset2D
 from seg_moe.data.indexing import infer_image_channels, infer_num_classes
 from seg_moe.data.oof import (
@@ -644,6 +642,10 @@ def _evaluate_fold(
               f"HD95={agg.get('hd95_mean', float('nan')):.2f}  "
               f"NSD={agg.get('nsd_mean', 0):.4f}")
 
+        if layer_tag != "L2":
+            print("  [skip learned combiners on L1 OOF; keep OLE only for L2]")
+            continue
+
         if skip_learned_combiners:
             print("  [skip learned combiners via --skip-learned-combiners]")
             continue
@@ -657,8 +659,6 @@ def _evaluate_fold(
 
         combiner_specs = [
             (f"{layer_tag}_ole", OLECombiner(mode="lsq_bounded")),
-            (f"{layer_tag}_dt", DecisionTemplateCombiner()),
-            (f"{layer_tag}_we_clpso", WECLPSOCombiner(n_particles=30, iters=100, seed=42)),
         ]
 
         for method, comb in combiner_specs:
@@ -731,7 +731,7 @@ def main() -> None:
     ap.add_argument("--allow-missing-gating-cache", action="store_true",
                     help="Do not fail when a trained gating checkpoint exists but metrics cache is missing")
     ap.add_argument("--skip-learned-combiners", action="store_true",
-                    help="Skip learned combiners (OLE / DT / WE-CLPSO) and only evaluate main methods")
+                    help="Skip learned combiners (currently L2 OLE) and only evaluate main methods")
     args = ap.parse_args()
 
     exp_cfg = load_config(args.exp)
@@ -1034,6 +1034,9 @@ def main() -> None:
 
         # ── Fit combiners ──
         print(f"  Collecting {layer_tag} fit data...")
+        if layer_tag != "L2":
+            print("  [skip learned combiners on L1 OOF; keep OLE only for L2]")
+            continue
         X_fit, y_fit = _collect_oof_flat(fit_rows, oof_map, dataset_cfg)
         if X_fit.size == 0:
             print(f"  [skip — no fit data]")
@@ -1041,8 +1044,6 @@ def main() -> None:
 
         combiner_specs = [
             (f"{layer_tag}_ole", OLECombiner(mode="lsq_bounded")),
-            (f"{layer_tag}_dt", DecisionTemplateCombiner()),
-            (f"{layer_tag}_we_clpso", WECLPSOCombiner(n_particles=30, iters=100, seed=42)),
         ]
 
         for method, comb in combiner_specs:

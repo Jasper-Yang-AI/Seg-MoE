@@ -178,37 +178,4 @@ python scripts/eval/run_test_pipeline.py `
   --predictor-fold 0 --gpus 0,1 --batch-size 32 --tta
 ```
 
-## 7. 写论文时主要看这些结果
 
-验证集汇总结果默认输出到：
-
-- `runs/segmoe_2d_prostate/results/metrics_prostate_local_all_val_folds.csv`
-- `runs/segmoe_2d_prostate/results/metrics_by_fold_prostate_local_all_val_folds.csv`
-- `runs/segmoe_2d_prostate/results/metrics_per_sample_prostate_local_all_val_folds.csv`
-
-固定测试集结果示例：
-
-- `runs/segmoe_2d_prostate/results/metrics_prostate_local_fold0_test.csv`
-
-如需导出论文表格，可额外执行：
-
-```powershell
-python scripts/eval/export_tables.py --exp configs/2d/exp/exp_prostate_local.yaml --folds 0 1 2 3 4
-```
-
-## 8. 推荐执行顺序
-
-```text
-1. prepare_prostate
-2. make_splits
-3. 训练并导入 nnUNet / SwinUNETR / SegResNet
-4. generate_layer1_oof
-5. train_layer2
-6. generate_layer2_oof
-7. train_gating
-8. gating_inference
-9. eval_methods
-10. run_test_pipeline
-```
-
-如果你的目标是尽快完成论文主实验，只需要沿着上面的主线跑通即可，不必再考虑 3D 或其他数据集配置。

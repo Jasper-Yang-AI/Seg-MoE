@@ -14,22 +14,6 @@ def test_combiner_shapes_smoke():
     fused = ole.predict(probs)
     assert fused.shape == (N, M)
 
-    from seg_moe.combiners.decision_template import DecisionTemplateCombiner
-
-    dt = DecisionTemplateCombiner()
-    dt.fit(probs, target, num_classes=M)
-    pred = dt.predict(probs)
-    assert pred.shape == (N, M), f"DT predict should return soft scores [N,M], got {pred.shape}"
-    pred_hard = dt.predict_hard(probs)
-    assert pred_hard.shape == (N,), f"DT predict_hard should return [N], got {pred_hard.shape}"
-
-    from seg_moe.combiners.we_clpso import WECLPSOCombiner
-
-    pso = WECLPSOCombiner(n_particles=5, iters=5, seed=0)
-    pso.fit(probs, target, num_classes=M)
-    fused2 = pso.predict(probs)
-    assert fused2.shape == (N, M)
-
     from seg_moe.combiners.ole import fit_from_oof, fuse, predict
 
     W_bvls = fit_from_oof(probs, target, method="bvls", bounds=(0.0, 1.0), seed=0)
@@ -76,15 +60,3 @@ def test_combiner_iterable_fit_smoke():
 
     w_stream = fit_from_oof(chunks, None, method="bvls", bounds=(0.0, 1.0), seed=0)
     assert w_stream.shape == (K, M)
-
-    from seg_moe.combiners.decision_template import DecisionTemplateCombiner
-
-    dt = DecisionTemplateCombiner()
-    dt.fit(chunks, None, num_classes=M)
-    assert dt.predict(probs).shape == (N, M)
-
-    from seg_moe.combiners.we_clpso import WECLPSOCombiner
-
-    pso = WECLPSOCombiner(n_particles=4, iters=3, seed=0)
-    pso.fit(chunks, None, num_classes=M)
-    assert pso.predict(probs).shape == (N, M)

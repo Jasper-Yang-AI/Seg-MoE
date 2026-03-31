@@ -1,5 +1,5 @@
 """
-Export combiner weights (OLE / WE-CLPSO) as readable JSON.
+Export combiner weights (currently OLE) as readable JSON.
 
 Usage:
     python scripts/eval/export_weights.py \

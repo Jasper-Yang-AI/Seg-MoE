@@ -125,7 +125,8 @@ def main() -> None:
     ap.add_argument("--skip-existing", action="store_true")
     ap.add_argument("--skip-live-inference", action="store_true")
     ap.add_argument("--no-uncertainty", action="store_true")
-    ap.add_argument("--skip-learned-combiners", action="store_true")
+    ap.add_argument("--skip-learned-combiners", action="store_true",
+                    help="Skip learned combiners during eval (currently OLE only)")
     ap.add_argument("--allow-missing-gating-cache", action="store_true")
     args = ap.parse_args()
 
